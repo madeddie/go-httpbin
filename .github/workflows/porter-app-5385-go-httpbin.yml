@@ -18,7 +18,7 @@ jobs:
               timeout-minutes: 30
               run: porter apply
               env:
-                PORTER_DOCKER_BUILDKIT: 1
+                DOCKER_BUILDKIT: "1"
                 PORTER_APP_NAME: go-httpbin
                 PORTER_CLUSTER: "5385"
                 PORTER_DEPLOYMENT_TARGET_ID: ddc13db1-23e7-4ab5-9963-ddc2f8afc56d
