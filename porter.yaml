@@ -10,6 +10,9 @@ services:
   terminationGracePeriodSeconds: 30
   port: 8080
   sleep: false
+  connections:
+  - type: awsRole
+    role: iam-role-name
 build:
   context: ./
   method: docker
