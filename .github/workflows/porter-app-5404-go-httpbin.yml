@@ -26,4 +26,4 @@ jobs:
                 PORTER_PROJECT: "17928"
                 PORTER_TAG: ${{ steps.vars.outputs.sha_short }}
                 PORTER_TOKEN_OLD: ${{ secrets.PORTER_APP_17928_1121825683 }}
-                PORTER_TOKEN: foo
+                PORTER_TOKEN: ${{ secrets.PORTER_TOKEN_TEST }}
