@@ -2,6 +2,10 @@
     push:
         branches:
             - main
+    pull_request:
+        branches:
+            - main
+    workflow_dispatch:
 name: Deploy to go-httpbin
 jobs:
     porter-deploy:
