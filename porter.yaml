@@ -1,18 +1,15 @@
 version: v2
 name: go-httpbin
 services:
-- name: web
-  run: ""
-  type: web
-  instances: 1
-  cpuCores: 0.1
-  ramMegabytes: 400
-  terminationGracePeriodSeconds: 30
-  port: 8080
-  sleep: false
-  connections:
-  - type: awsRole
-    role: iam-role-name
+  - name: web
+    run: ""
+    type: web
+    instances: 1
+    cpuCores: 0.1
+    ramMegabytes: 400
+    terminationGracePeriodSeconds: 30
+    port: 8080
+    sleep: false
 build:
   context: ./
   method: docker
