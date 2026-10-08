@@ -103,10 +103,11 @@ variables (or a combination of the two):
 | - | - | - | - |
 | `-allowed-redirect-domains` | `ALLOWED_REDIRECT_DOMAINS` | Comma-separated list of domains the /redirect-to endpoint will allow | |
 | `-exclude-headers` | `EXCLUDE_HEADERS` | Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard suffix matching. For example: `"foo,bar,x-fc-*"` | - |
-| `-host` | `HOST` | Host to listen on | "0.0.0.0" |
+| `-host` | `HOST` | Host to listen on | 0.0.0.0 |
 | `-https-cert-file` | `HTTPS_CERT_FILE` | HTTPS Server certificate file | |
 | `-https-key-file` | `HTTPS_KEY_FILE` | HTTPS Server private key file | |
-| `-log-format` | `LOG_FORMAT` | Log format (text or json) | "text" |
+| `-log-format` | `LOG_FORMAT` | Log format (text or json) | text |
+| `-log-level` | `LOG_LEVEL` | Logging level (DEBUG, INFO, WARN, ERROR, OFF)  | INFO |
 | `-max-body-size` | `MAX_BODY_SIZE` | Maximum size of request or response, in bytes | 1048576 |
 | `-max-duration` | `MAX_DURATION` | Maximum duration a response may take | 10s |
 | `-port` | `PORT` | Port to listen on | 8080 |
@@ -114,7 +115,9 @@ variables (or a combination of the two):
 | `-srv-max-header-bytes` | `SRV_MAX_HEADER_BYTES` | Value to use for the http.Server's MaxHeaderBytes option | 16384 |
 | `-srv-read-header-timeout` | `SRV_READ_HEADER_TIMEOUT` | Value to use for the http.Server's ReadHeaderTimeout option | 1s |
 | `-srv-read-timeout` | `SRV_READ_TIMEOUT` | Value to use for the http.Server's ReadTimeout option | 5s |
+| `-use-full-version` | `USE_FULL_VERSION` | Expose full version details (release, commit, build date, Go runtime) via the /version endpoint (default: service name only) | false |
 | `-use-real-hostname` | `USE_REAL_HOSTNAME` | Expose real hostname as reported by os.Hostname() in the /hostname endpoint | false |
+| `-version` | | Print version and exit | |
 
 > [!WARNING]
 > These configuration options are dangerous and/or deprecated and should be

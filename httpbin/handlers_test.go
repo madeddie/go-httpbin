@@ -30,89 +30,131 @@ import (
 	"github.com/mccutchen/go-httpbin/v2/internal/testing/must"
 )
 
-const (
-	maxBodySize int64         = 1024
-	maxDuration time.Duration = 1 * time.Second
-	testPrefix                = "/a-prefix"
-)
-
-type environment struct {
-	prefix string
-	srv    *httptest.Server
-	client *http.Client
+// appTestInfo carries the setup necessary for each unit test below, forming
+// the basis for a mini test "framework" used across the test suite. It
+// comprises
+type appTestInfo struct {
+	// App is the [HTTPBin] instance under test, configured by [createApp].
+	App *HTTPBin
+	// Srv is an [httptest.Server] running that instance.
+	Srv *httptest.Server
+	// Client is an [http.Client] configured to connect to the target server.
+	Client *http.Client
+	// baseURL is the URL for the instance under test (i.e. Srv.URL).
+	baseURL string
+	// cfg represents the configuration for the server under test.
+	cfg targetConfig
 }
 
-// "Global" test app, server, & client to be reused across test cases.
-// Initialized in TestMain.
-var (
-	app        *HTTPBin
-	srv        *httptest.Server
-	client     *http.Client
-	envs       []*environment
-	defaultEnv *environment
-)
+// targetConfig captures the configuration values tests need to know about the
+// server under test.
+type targetConfig struct {
+	Prefix        string
+	MaxBodySize   int64
+	MaxDuration   time.Duration
+	MaxSSECount   int64
+	MaxJSONLCount int64
+}
 
+// configFromApp builds a [targetConfig] from an in-process [HTTPBin].
+func configFromApp(app *HTTPBin) targetConfig {
+	return targetConfig{
+		Prefix:        app.prefix,
+		MaxBodySize:   app.MaxBodySize,
+		MaxDuration:   app.MaxDuration,
+		MaxSSECount:   app.maxSSECount,
+		MaxJSONLCount: app.maxJSONLCount,
+	}
+}
+
+// URL generates the full URL for the given path and optional query params,
+// pointing at the current target server.
+func (appT *appTestInfo) URL(path string, params ...url.Values) string {
+	u := appT.baseURL + path
+	for i, p := range params {
+		if i == 0 && p != nil { // ignore nil params always passed through by some helpers (e.g. doGetRequest)
+			u += "?"
+		}
+		u += p.Encode()
+	}
+	return u
+}
+
+// setupTestApp creates an [HTTPBin] instance with the given opts, starts a
+// new [httptest.Server], and configures a client for that server. The
+// returned struct encompasses all three.
+//
+// The server will be closed automatically when the test ends.
+func setupTestApp(t *testing.T, opts ...OptionFunc) *appTestInfo {
+	app := createApp(opts...)
+	srv := httptest.NewServer(app)
+	t.Cleanup(srv.Close)
+
+	client := srv.Client()
+	client.Timeout = 5 * time.Second
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	return &appTestInfo{
+		App:     app,
+		Srv:     srv,
+		Client:  client,
+		baseURL: srv.URL,
+		cfg:     configFromApp(app),
+	}
+}
+
+// createApp creates an [HTTPBin] instance with default configuration, which
+// can be overridden by the given opts.
 func createApp(opts ...OptionFunc) *HTTPBin {
-	return New(append(append(make([]OptionFunc, 0, 6+len(opts)),
-		WithAllowedRedirectDomains([]string{
-			"httpbingo.org",
-			"example.org",
-			"www.example.com",
-		}),
+	defaults := append([]OptionFunc{},
 		WithDefaultParams(DefaultParams{
 			DripDelay:    0,
 			DripDuration: 100 * time.Millisecond,
 			DripNumBytes: 10,
-			SSECount:     10,
-			SSEDelay:     0,
-			SSEDuration:  100 * time.Millisecond,
+
+			SSECount:    10,
+			SSEDelay:    0,
+			SSEDuration: 100 * time.Millisecond,
+
+			JSONLCount:    10,
+			JSONLDelay:    0,
+			JSONLDuration: 0,
 		}),
-		WithMaxBodySize(maxBodySize),
-		WithMaxDuration(maxDuration),
+		WithMaxBodySize(1024),
+		WithMaxDuration(1*time.Second),
 		WithObserver(StdLogObserver(slog.New(slog.NewTextHandler(io.Discard, nil)))),
-		WithExcludeHeaders("x-ignore-*,x-info-this-key")),
-		opts...)...)
+	)
+	return New(append(defaults, opts...)...)
 }
 
 func TestMain(m *testing.M) {
 	// enable additional safety checks
 	testMode = true
-
-	var env *environment
-	app = createApp()
-	env = newTestEnvironment(app)
-	defer env.srv.Close()
-	srv = env.srv
-	client = env.client
-	envs = append(envs, env)
-	defaultEnv = env
-
-	env = newTestEnvironment(createApp(WithPrefix(testPrefix)))
-	defer env.srv.Close()
-	envs = append(envs, env)
-
 	os.Exit(m.Run())
 }
 
 func TestIndex(t *testing.T) {
-	for _, env := range envs {
-		t.Run("ok"+env.prefix, func(t *testing.T) {
+	t.Parallel()
+	for _, prefix := range []string{"", "/test-prefix"} {
+		t.Run("ok"+prefix, func(t *testing.T) {
 			t.Parallel()
-
-			req := newTestRequest(t, "GET", env.prefix+"/", env)
-			resp := must.DoReq(t, env.client, req)
-
+			app := setupTestApp(t, WithPrefix(prefix))
+			req := newTestRequest(t, "GET", app.URL(prefix+"/"), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.ContentType(t, resp, htmlContentType)
 			assert.Header(t, resp, "Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' camo.githubusercontent.com")
 			body := must.ReadAll(t, resp.Body)
 			assert.Contains(t, body, "go-httpbin", "body")
-			assert.Contains(t, body, env.prefix+"/get", "body")
+			assert.Contains(t, body, prefix+"/get", "body")
 		})
 
-		t.Run("not found"+env.prefix, func(t *testing.T) {
+		t.Run("not found"+prefix, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", env.prefix+"/foo", env)
-			resp := must.DoReq(t, env.client, req)
+			app := setupTestApp(t, WithPrefix(prefix))
+			req := newTestRequest(t, "GET", app.URL(prefix+"/foo"), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusNotFound)
 			assert.ContentType(t, resp, textContentType)
 		})
@@ -120,10 +162,12 @@ func TestIndex(t *testing.T) {
 }
 
 func TestEnv(t *testing.T) {
+	t.Parallel()
 	t.Run("default environment", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/env")
-		resp := must.DoReq(t, client, req)
+		app := setupTestApp(t)
+		req := newTestRequest(t, "GET", app.URL("/env"), nil)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[envResponse](t, resp)
 		assert.Equal(t, len(result.Env), 0, "environment variables unexpected")
 	})
@@ -132,8 +176,9 @@ func TestEnv(t *testing.T) {
 func TestFormsPost(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/forms/post")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/forms/post"), nil)
+	resp := mustDoRequest(t, app, req)
 
 	assert.ContentType(t, resp, htmlContentType)
 	assert.BodyContains(t, resp, `<form method="post" action="/post">`)
@@ -142,29 +187,28 @@ func TestFormsPost(t *testing.T) {
 func TestUTF8(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/encoding/utf8")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/encoding/utf8"), nil)
+	resp := mustDoRequest(t, app, req)
 
 	assert.ContentType(t, resp, htmlContentType)
 	assert.BodyContains(t, resp, `Hello world, Καλημέρα κόσμε, コンニチハ`)
 }
 
 func TestGet(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t, WithExcludeHeaders("x-ignore-*,x-info-this-key"))
+
 	doGetRequest := func(t *testing.T, path string, params url.Values, headers http.Header) noBodyResponse {
 		t.Helper()
-
-		if params != nil {
-			path = fmt.Sprintf("%s?%s", path, params.Encode())
-		}
-		req := newTestRequest(t, "GET", path)
+		req := newTestRequest(t, "GET", app.URL(path, params), nil)
 		req.Header.Set("User-Agent", "test")
 		for k, vs := range headers {
 			for _, v := range vs {
 				req.Header.Add(k, v)
 			}
 		}
-
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		return mustParseResponse[noBodyResponse](t, resp)
 	}
 
@@ -174,7 +218,7 @@ func TestGet(t *testing.T) {
 		result := doGetRequest(t, "/get", nil, nil)
 		assert.Equal(t, result.Method, "GET", "method mismatch")
 		assert.Equal(t, result.Args.Encode(), "", "expected empty args")
-		assert.Equal(t, result.URL, srv.URL+"/get", "url mismatch")
+		assert.Equal(t, result.URL, app.URL("/get"), "url mismatch")
 
 		if !strings.HasPrefix(result.Origin, "127.0.0.1") {
 			t.Fatalf("expected 127.0.0.1 origin, got %q", result.Origin)
@@ -211,7 +255,6 @@ func TestGet(t *testing.T) {
 		params.Add("bar", "bar2")
 
 		header := http.Header{}
-
 		header.Set("X-Ignore-Foo", "foo")
 		header.Set("X-Info-Foo", "bar")
 		header.Set("x-info-this-key", "baz")
@@ -219,16 +262,16 @@ func TestGet(t *testing.T) {
 		result := doGetRequest(t, "/get", params, header)
 		assert.Equal(t, result.Args.Encode(), params.Encode(), "args mismatch")
 		assert.Equal(t, result.Method, "GET", "method mismatch")
-		assertHeaderEqual(t, &result.Headers, "X-Ignore-Foo", "")
-		assertHeaderEqual(t, &result.Headers, "x-info-this-key", "")
-		assertHeaderEqual(t, &result.Headers, "X-Info-Foo", "bar")
+		assert.Equal(t, result.Headers.Get("X-Ignore-Foo"), "", "unexpected header")
+		assert.Equal(t, result.Headers.Get("x-info-this-key"), "", "unexpected header")
+		assert.Equal(t, result.Headers.Get("X-Info-Foo"), "bar", "incorrect header")
 	})
 
 	t.Run("only_allows_gets", func(t *testing.T) {
 		t.Parallel()
 
-		req := newTestRequest(t, "POST", "/get")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "POST", app.URL("/get"), nil)
+		resp := mustDoRequest(t, app, req)
 
 		assert.StatusCode(t, resp, http.StatusMethodNotAllowed)
 		assert.ContentType(t, resp, textContentType)
@@ -256,6 +299,8 @@ func TestGet(t *testing.T) {
 }
 
 func TestHead(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
 	testCases := []struct {
 		verb     string
 		path     string
@@ -271,9 +316,8 @@ func TestHead(t *testing.T) {
 		t.Run(fmt.Sprintf("%s %s", tc.verb, tc.path), func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, tc.verb, tc.path)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, tc.verb, app.URL(tc.path), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, tc.wantCode)
 
 			// we only do further validation when we get an OK response
@@ -289,25 +333,28 @@ func TestHead(t *testing.T) {
 }
 
 func TestCORS(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("no_request_origin", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/get")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/get"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.Header(t, resp, "Access-Control-Allow-Origin", "*")
 	})
 
 	t.Run("with_request_origin", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/get")
+		req := newTestRequest(t, "GET", app.URL("/get"), nil)
 		req.Header.Set("Origin", "origin")
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.Header(t, resp, "Access-Control-Allow-Origin", "origin")
 	})
 
 	t.Run("options_request", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "OPTIONS", "/get")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "OPTIONS", app.URL("/get"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, 200)
 
 		headerTests := []struct {
@@ -316,7 +363,7 @@ func TestCORS(t *testing.T) {
 		}{
 			{"Access-Control-Allow-Origin", "*"},
 			{"Access-Control-Allow-Credentials", "true"},
-			{"Access-Control-Allow-Methods", "GET, POST, HEAD, PUT, DELETE, PATCH, OPTIONS"},
+			{"Access-Control-Allow-Methods", "GET, POST, HEAD, PUT, DELETE, PATCH, QUERY, OPTIONS"},
 			{"Access-Control-Max-Age", "3600"},
 			{"Access-Control-Allow-Headers", ""},
 		}
@@ -328,9 +375,9 @@ func TestCORS(t *testing.T) {
 	t.Run("allow_headers", func(t *testing.T) {
 		t.Parallel()
 
-		req := newTestRequest(t, "OPTIONS", "/get")
+		req := newTestRequest(t, "OPTIONS", app.URL("/get"), nil)
 		req.Header.Set("Access-Control-Request-Headers", "X-Test-Header")
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, 200)
 
 		headerTests := []struct {
@@ -376,26 +423,21 @@ func TestIP(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
+			// this test does not use a real server, because we need to control
+			// the RemoteAddr field on the request object to make the test
+			// deterministic.
+			app := createApp()
+			w := httptest.NewRecorder()
+
 			req, _ := http.NewRequest("GET", "/ip", nil)
 			req.RemoteAddr = tc.remoteAddr
 			for k, v := range tc.headers {
 				req.Header.Set(k, v)
 			}
 
-			// this test does not use a real server, because we need to control
-			// the RemoteAddr field on the request object to make the test
-			// deterministic.
-			w := httptest.NewRecorder()
 			app.ServeHTTP(w, req)
-
-			if w.Code != http.StatusOK {
-				t.Errorf("wanted status code %d, got %d", http.StatusOK, w.Code)
-			}
-
-			if ct := w.Header().Get("Content-Type"); ct != jsonContentType {
-				t.Errorf("expected content type %q, got %q", jsonContentType, ct)
-			}
-
+			assert.Equal(t, w.Code, http.StatusOK, "wrong status code")
+			assert.Equal(t, w.Header().Get("Content-Type"), jsonContentType, "wrong content type")
 			result := must.Unmarshal[ipResponse](t, w.Body)
 			assert.Equal(t, result.Origin, tc.wantOrigin, "incorrect origin")
 		})
@@ -408,7 +450,8 @@ func TestIP(t *testing.T) {
 		// to verify handling of both cases.
 		t.Parallel()
 
-		resp, err := client.Get(srv.URL + "/ip")
+		app := setupTestApp(t)
+		resp, err := app.Client.Get(app.Srv.URL + "/ip")
 		assert.NilError(t, err)
 		defer resp.Body.Close()
 
@@ -418,15 +461,56 @@ func TestIP(t *testing.T) {
 		result := must.Unmarshal[ipResponse](t, resp.Body)
 		assert.Equal(t, result.Origin, "127.0.0.1", "incorrect origin")
 	})
+
+	t.Run("format=text", func(t *testing.T) {
+		t.Parallel()
+
+		textFormatCases := map[string]struct {
+			remoteAddr string
+			headers    map[string]string
+			wantOrigin string
+		}{
+			"remote addr": {
+				remoteAddr: "192.168.0.100",
+				wantOrigin: "192.168.0.100",
+			},
+			"x-forwarded-for": {
+				remoteAddr: "192.168.0.100",
+				headers:    map[string]string{"X-Forwarded-For": "10.1.1.1, 10.2.2.2"},
+				wantOrigin: "10.1.1.1",
+			},
+		}
+
+		for name, tc := range textFormatCases {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				app := createApp()
+				w := httptest.NewRecorder()
+
+				req, _ := http.NewRequest("GET", "/ip?format=text", nil)
+				req.RemoteAddr = tc.remoteAddr
+				for k, v := range tc.headers {
+					req.Header.Set(k, v)
+				}
+
+				app.ServeHTTP(w, req)
+				assert.Equal(t, w.Code, http.StatusOK, "wrong status code")
+				assert.Equal(t, w.Header().Get("Content-Type"), textContentType, "wrong content type")
+				assert.Equal(t, w.Body.String(), tc.wantOrigin+"\n", "wrong body")
+			})
+		}
+	})
 }
 
 func TestUserAgent(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/user-agent")
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/user-agent"), nil)
 	req.Header.Set("User-Agent", "test")
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[userAgentResponse](t, resp)
 	assert.Equal(t, "test", result.UserAgent, "incorrect user agent")
 }
@@ -434,14 +518,15 @@ func TestUserAgent(t *testing.T) {
 func TestHeaders(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/headers")
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/headers"), nil)
 	req.Host = "test-host"
 	req.Header.Set("User-Agent", "test")
 	req.Header.Set("Foo-Header", "foo")
 	req.Header.Add("Bar-Header", "bar1")
 	req.Header.Add("Bar-Header", "bar2")
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[headersResponse](t, resp)
 
 	// Host header requires special treatment, because it's a field on the
@@ -456,23 +541,30 @@ func TestHeaders(t *testing.T) {
 }
 
 func TestPost(t *testing.T) {
-	testRequestWithBody(t, "POST", "/post")
+	t.Parallel()
+	testRequestWithBody(t, setupTestApp(t), "POST", "/post")
 }
 
 func TestPut(t *testing.T) {
-	testRequestWithBody(t, "PUT", "/put")
+	t.Parallel()
+	testRequestWithBody(t, setupTestApp(t), "PUT", "/put")
 }
 
 func TestDelete(t *testing.T) {
-	testRequestWithBody(t, "DELETE", "/delete")
+	t.Parallel()
+	testRequestWithBody(t, setupTestApp(t), "DELETE", "/delete")
 }
 
 func TestPatch(t *testing.T) {
-	testRequestWithBody(t, "PATCH", "/patch")
+	t.Parallel()
+	testRequestWithBody(t, setupTestApp(t), "PATCH", "/patch")
 }
 
 func TestAnything(t *testing.T) {
+	t.Parallel()
+
 	var (
+		app   = setupTestApp(t)
 		verbs = []string{
 			"GET",
 			"DELETE",
@@ -487,72 +579,88 @@ func TestAnything(t *testing.T) {
 	)
 	for _, path := range paths {
 		for _, verb := range verbs {
-			testRequestWithBody(t, verb, path)
+			testRequestWithBody(t, app, verb, path)
 		}
 	}
 
 	t.Run("HEAD", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "HEAD", "/anything")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "HEAD", app.URL("/anything"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.BodyEquals(t, resp, "")
 		assert.Header(t, resp, "Content-Length", "") // responses to HEAD requests should not have a Content-Length header
 	})
 }
 
-func testRequestWithBody(t *testing.T, verb, path string) {
+func testRequestWithBody(t *testing.T, app *appTestInfo, verb, path string) {
 	t.Run("BinaryBody", func(t *testing.T) {
-		testRequestWithBodyBinaryBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyBinaryBody(t, app, verb, path)
 	})
 	t.Run("BodyTooBig", func(t *testing.T) {
-		testRequestWithBodyBodyTooBig(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyBodyTooBig(t, app, verb, path)
 	})
 	t.Run("EmptyBody", func(t *testing.T) {
-		testRequestWithBodyEmptyBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyEmptyBody(t, app, verb, path)
 	})
 	t.Run("Expect100Continue", func(t *testing.T) {
-		testRequestWithBodyExpect100Continue(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyExpect100Continue(t, app, verb, path)
 	})
 	t.Run("FormEncodedBody", func(t *testing.T) {
-		testRequestWithBodyFormEncodedBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyFormEncodedBody(t, app, verb, path)
 	})
 	t.Run("FormEncodedBodyNoContentType", func(t *testing.T) {
-		testRequestWithBodyFormEncodedBodyNoContentType(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyFormEncodedBodyNoContentType(t, app, verb, path)
 	})
 	t.Run("HTML", func(t *testing.T) {
-		testRequestWithBodyHTML(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyHTML(t, app, verb, path)
 	})
 	t.Run("InvalidFormEncodedBody", func(t *testing.T) {
-		testRequestWithBodyInvalidFormEncodedBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyInvalidFormEncodedBody(t, app, verb, path)
 	})
 	t.Run("InvalidJSON", func(t *testing.T) {
-		testRequestWithBodyInvalidJSON(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyInvalidJSON(t, app, verb, path)
 	})
 	t.Run("InvalidMultiPartBody", func(t *testing.T) {
-		testRequestWithBodyInvalidMultiPartBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyInvalidMultiPartBody(t, app, verb, path)
 	})
 	t.Run("JSON", func(t *testing.T) {
-		testRequestWithBodyJSON(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyJSON(t, app, verb, path)
 	})
 	t.Run("MultiPartBody", func(t *testing.T) {
-		testRequestWithBodyMultiPartBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyMultiPartBody(t, app, verb, path)
 	})
 	t.Run("MultiPartBodyFiles", func(t *testing.T) {
-		testRequestWithBodyMultiPartBodyFiles(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyMultiPartBodyFiles(t, app, verb, path)
 	})
 	t.Run("QueryParams", func(t *testing.T) {
-		testRequestWithBodyQueryParams(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyQueryParams(t, app, verb, path)
 	})
 	t.Run("QueryParamsAndBody", func(t *testing.T) {
-		testRequestWithBodyQueryParamsAndBody(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyQueryParamsAndBody(t, app, verb, path)
 	})
 	t.Run("TransferEncoding", func(t *testing.T) {
-		testRequestWithBodyTransferEncoding(t, verb, path)
+		t.Parallel()
+		testRequestWithBodyTransferEncoding(t, app, verb, path)
 	})
 }
 
-func testRequestWithBodyBinaryBody(t *testing.T, verb string, path string) {
+func testRequestWithBodyBinaryBody(t *testing.T, app *appTestInfo, verb string, path string) {
 	tests := []struct {
 		contentType string
 		requestBody string
@@ -567,12 +675,10 @@ func testRequestWithBodyBinaryBody(t *testing.T, verb string, path string) {
 		t.Run("content type/"+test.contentType, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequestWithBody(t, verb, path, bytes.NewReader([]byte(test.requestBody)))
+			req := newTestRequest(t, verb, app.URL(path), bytes.NewReader([]byte(test.requestBody)))
 			req.Header.Set("Content-Type", test.contentType)
 
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
-
+			resp := mustDoRequest(t, app, req)
 			result := mustParseResponse[bodyResponse](t, resp)
 			assert.Equal(t, result.Method, verb, "method mismatch")
 			assert.DeepEqual(t, result.Args, nilValues, "expected empty args")
@@ -586,7 +692,7 @@ func testRequestWithBodyBinaryBody(t *testing.T, verb string, path string) {
 	}
 }
 
-func testRequestWithBodyEmptyBody(t *testing.T, verb string, path string) {
+func testRequestWithBodyEmptyBody(t *testing.T, app *appTestInfo, verb string, path string) {
 	tests := []struct {
 		contentType string
 	}{
@@ -599,12 +705,10 @@ func testRequestWithBodyEmptyBody(t *testing.T, verb string, path string) {
 		t.Run("content type/"+test.contentType, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, verb, path)
+			req := newTestRequest(t, verb, app.URL(path), nil)
 			req.Header.Set("Content-Type", test.contentType)
 
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
-
+			resp := mustDoRequest(t, app, req)
 			result := mustParseResponse[bodyResponse](t, resp)
 			assert.Equal(t, result.Data, "", "expected empty response data")
 			assert.Equal(t, result.Method, verb, "method mismatch")
@@ -616,16 +720,16 @@ func testRequestWithBodyEmptyBody(t *testing.T, verb string, path string) {
 	}
 }
 
-func testRequestWithBodyFormEncodedBody(t *testing.T, verb, path string) {
+func testRequestWithBodyFormEncodedBody(t *testing.T, app *appTestInfo, verb, path string) {
 	params := url.Values{}
 	params.Set("foo", "foo")
 	params.Add("bar", "bar1")
 	params.Add("bar", "bar2")
 
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader(params.Encode()))
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader(params.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.DeepEqual(t, result.Form, params, "form data mismatch")
@@ -635,19 +739,19 @@ func testRequestWithBodyFormEncodedBody(t *testing.T, verb, path string) {
 	assert.DeepEqual(t, result.JSON, nil, "expected nil json")
 }
 
-func testRequestWithBodyHTML(t *testing.T, verb, path string) {
+func testRequestWithBodyHTML(t *testing.T, app *appTestInfo, verb, path string) {
 	data := "<html><body><h1>hello world</h1></body></html>"
 
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader(data))
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader(data))
 	req.Header.Set("Content-Type", htmlContentType)
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.StatusCode(t, resp, http.StatusOK)
 	assert.ContentType(t, resp, jsonContentType)
 	assert.BodyContains(t, resp, data)
 }
 
-func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
+func testRequestWithBodyExpect100Continue(t *testing.T, app *appTestInfo, verb, path string) {
 	// The stdlib http client automagically handles 100 Continue responses
 	// by continuing the request until a "final" 200 OK response is
 	// received, which prevents us from confirming that a 100 Continue
@@ -660,13 +764,13 @@ func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
 	t.Run("non-zero content-length okay", func(t *testing.T) {
 		t.Parallel()
 
-		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		conn, err := net.Dial("tcp", app.Srv.Listener.Addr().String())
 		assert.NilError(t, err)
 		defer conn.Close()
 
 		body := []byte("test body")
 
-		req := newTestRequestWithBody(t, verb, path, bytes.NewReader(body))
+		req := newTestRequest(t, verb, app.URL(path), bytes.NewReader(body))
 		req.Header.Set("Expect", "100-continue")
 		req.Header.Set("Content-Type", "text/plain")
 
@@ -710,7 +814,7 @@ func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
 	t.Run("transfer-encoding:chunked okay", func(t *testing.T) {
 		t.Parallel()
 
-		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		conn, err := net.Dial("tcp", app.Srv.Listener.Addr().String())
 		assert.NilError(t, err)
 		defer conn.Close()
 
@@ -772,11 +876,11 @@ func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
 		// the request is processed normally.
 		t.Parallel()
 
-		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		conn, err := net.Dial("tcp", app.Srv.Listener.Addr().String())
 		assert.NilError(t, err)
 		defer conn.Close()
 
-		req := newTestRequest(t, verb, path)
+		req := newTestRequest(t, verb, app.URL(path), nil)
 		req.Header.Set("Expect", "100-continue")
 
 		reqBytes, _ := httputil.DumpRequestOut(req, false)
@@ -813,14 +917,14 @@ func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
 	})
 }
 
-func testRequestWithBodyFormEncodedBodyNoContentType(t *testing.T, verb, path string) {
+func testRequestWithBodyFormEncodedBodyNoContentType(t *testing.T, app *appTestInfo, verb, path string) {
 	params := url.Values{}
 	params.Set("foo", "foo")
 	params.Add("bar", "bar1")
 	params.Add("bar", "bar2")
 
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader(params.Encode()))
-	resp := must.DoReq(t, client, req)
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader(params.Encode()))
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.Equal(t, result.Method, verb, "method mismatch")
@@ -834,7 +938,7 @@ func testRequestWithBodyFormEncodedBodyNoContentType(t *testing.T, verb, path st
 	assert.Equal(t, result.Data, expectedBody, "response data mismatch")
 }
 
-func testRequestWithBodyMultiPartBody(t *testing.T, verb, path string) {
+func testRequestWithBodyMultiPartBody(t *testing.T, app *appTestInfo, verb, path string) {
 	params := url.Values{
 		"foo": {"foo"},
 		"bar": {"bar1", "bar2"},
@@ -854,10 +958,10 @@ func testRequestWithBodyMultiPartBody(t *testing.T, verb, path string) {
 	}
 	mw.Close()
 
-	req := newTestRequestWithBody(t, verb, path, bytes.NewReader(body.Bytes()))
+	req := newTestRequest(t, verb, app.URL(path), bytes.NewReader(body.Bytes()))
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.Equal(t, result.Method, verb, "method mismatch")
@@ -867,7 +971,7 @@ func testRequestWithBodyMultiPartBody(t *testing.T, verb, path string) {
 	assert.DeepEqual(t, result.JSON, nil, "expected nil JSON")
 }
 
-func testRequestWithBodyMultiPartBodyFiles(t *testing.T, verb, path string) {
+func testRequestWithBodyMultiPartBodyFiles(t *testing.T, app *appTestInfo, verb, path string) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 
@@ -876,10 +980,10 @@ func testRequestWithBodyMultiPartBodyFiles(t *testing.T, verb, path string) {
 	part.Write([]byte("hello world"))
 	mw.Close()
 
-	req := newTestRequestWithBody(t, verb, path, bytes.NewReader(body.Bytes()))
+	req := newTestRequest(t, verb, app.URL(path), bytes.NewReader(body.Bytes()))
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.Equal(t, result.Method, verb, "method mismatch")
@@ -895,21 +999,21 @@ func testRequestWithBodyMultiPartBodyFiles(t *testing.T, verb, path string) {
 	assert.DeepEqual(t, result.Files, wantFiles, "files mismatch")
 }
 
-func testRequestWithBodyInvalidFormEncodedBody(t *testing.T, verb, path string) {
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader("%ZZ"))
+func testRequestWithBodyInvalidFormEncodedBody(t *testing.T, app *appTestInfo, verb, path string) {
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader("%ZZ"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.StatusCode(t, resp, http.StatusBadRequest)
 }
 
-func testRequestWithBodyInvalidMultiPartBody(t *testing.T, verb, path string) {
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader("%ZZ"))
+func testRequestWithBodyInvalidMultiPartBody(t *testing.T, app *appTestInfo, verb, path string) {
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader("%ZZ"))
 	req.Header.Set("Content-Type", "multipart/form-data; etc")
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.StatusCode(t, resp, http.StatusBadRequest)
 }
 
-func testRequestWithBodyJSON(t *testing.T, verb, path string) {
+func testRequestWithBodyJSON(t *testing.T, app *appTestInfo, verb, path string) {
 	type testInput struct {
 		Foo  string
 		Bar  int
@@ -924,10 +1028,10 @@ func testRequestWithBodyJSON(t *testing.T, verb, path string) {
 	}
 	inputBody, _ := json.Marshal(input)
 
-	req := newTestRequestWithBody(t, verb, path, bytes.NewReader(inputBody))
+	req := newTestRequest(t, verb, app.URL(path), bytes.NewReader(inputBody))
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.Equal(t, result.Data, string(inputBody), "response data mismatch")
@@ -945,28 +1049,28 @@ func testRequestWithBodyJSON(t *testing.T, verb, path string) {
 	assert.DeepEqual(t, roundTrippedInput, input, "round-tripped JSON mismatch")
 }
 
-func testRequestWithBodyInvalidJSON(t *testing.T, verb, path string) {
-	req := newTestRequestWithBody(t, verb, path, strings.NewReader("foo"))
+func testRequestWithBodyInvalidJSON(t *testing.T, app *appTestInfo, verb, path string) {
+	req := newTestRequest(t, verb, app.URL(path), strings.NewReader("foo"))
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.StatusCode(t, resp, http.StatusBadRequest)
 }
 
-func testRequestWithBodyBodyTooBig(t *testing.T, verb, path string) {
-	body := make([]byte, maxBodySize+1)
-	req := newTestRequestWithBody(t, verb, path, bytes.NewReader(body))
-	resp := must.DoReq(t, client, req)
+func testRequestWithBodyBodyTooBig(t *testing.T, app *appTestInfo, verb, path string) {
+	body := make([]byte, app.cfg.MaxBodySize+1)
+	req := newTestRequest(t, verb, app.URL(path), bytes.NewReader(body))
+	resp := mustDoRequest(t, app, req)
 	assert.StatusCode(t, resp, http.StatusBadRequest)
 }
 
-func testRequestWithBodyQueryParams(t *testing.T, verb, path string) {
+func testRequestWithBodyQueryParams(t *testing.T, app *appTestInfo, verb, path string) {
 	params := url.Values{}
 	params.Set("foo", "foo")
 	params.Add("bar", "bar1")
 	params.Add("bar", "bar2")
 
-	req := newTestRequest(t, verb, fmt.Sprintf("%s?%s", path, params.Encode()))
-	resp := must.DoReq(t, client, req)
+	req := newTestRequest(t, verb, app.URL(path, params), nil)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[bodyResponse](t, resp)
 
 	assert.DeepEqual(t, result.Args, params, "args mismatch")
@@ -978,7 +1082,7 @@ func testRequestWithBodyQueryParams(t *testing.T, verb, path string) {
 	assert.DeepEqual(t, result.JSON, nil, "expected nil JSON")
 }
 
-func testRequestWithBodyQueryParamsAndBody(t *testing.T, verb, path string) {
+func testRequestWithBodyQueryParamsAndBody(t *testing.T, app *appTestInfo, verb, path string) {
 	args := url.Values{}
 	args.Set("query1", "foo")
 	args.Add("query2", "bar1")
@@ -989,10 +1093,9 @@ func testRequestWithBodyQueryParamsAndBody(t *testing.T, verb, path string) {
 	form.Add("form2", "bar1")
 	form.Add("form2", "bar2")
 
-	url := fmt.Sprintf("%s?%s", path, args.Encode())
-	req := newTestRequestWithBody(t, verb, url, strings.NewReader(form.Encode()))
+	req := newTestRequest(t, verb, app.URL(path, args), strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 
 	result := mustParseResponse[bodyResponse](t, resp)
 	assert.Equal(t, result.Method, verb, "method mismatch")
@@ -1000,7 +1103,7 @@ func testRequestWithBodyQueryParamsAndBody(t *testing.T, verb, path string) {
 	assert.Equal(t, result.Form.Encode(), form.Encode(), "form mismatch")
 }
 
-func testRequestWithBodyTransferEncoding(t *testing.T, verb, path string) {
+func testRequestWithBodyTransferEncoding(t *testing.T, app *appTestInfo, verb, path string) {
 	testCases := []struct {
 		given string
 		want  string
@@ -1013,14 +1116,12 @@ func testRequestWithBodyTransferEncoding(t *testing.T, verb, path string) {
 		t.Run("transfer-encoding/"+tc.given, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequestWithBody(t, verb, path, bytes.NewReader([]byte("{}")))
+			req := newTestRequest(t, verb, app.URL(path), bytes.NewReader([]byte("{}")))
 			if tc.given != "" {
 				req.TransferEncoding = []string{tc.given}
 			}
 
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
-
+			resp := mustDoRequest(t, app, req)
 			result := mustParseResponse[bodyResponse](t, resp)
 			got := result.Headers.Get("Transfer-Encoding")
 			assert.Equal(t, got, tc.want, "Transfer-Encoding header mismatch")
@@ -1030,6 +1131,8 @@ func testRequestWithBodyTransferEncoding(t *testing.T, verb, path string) {
 
 // TODO: implement and test more complex /status endpoint
 func TestStatus(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
 	redirectHeaders := map[string]string{
 		"Location": "/redirect/1",
 	}
@@ -1072,9 +1175,8 @@ func TestStatus(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("ok/status/%d", test.code), func(t *testing.T) {
 			t.Parallel()
-			req, _ := http.NewRequest("GET", srv.URL+fmt.Sprintf("/status/%d", test.code), nil)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(fmt.Sprintf("/status/%d", test.code)), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 			assert.BodyEquals(t, resp, test.body)
 			for key, val := range test.headers {
@@ -1099,9 +1201,8 @@ func TestStatus(t *testing.T) {
 	for _, test := range errorTests {
 		t.Run("error"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
@@ -1117,11 +1218,11 @@ func TestStatus(t *testing.T) {
 		// indication we need.
 		t.Parallel()
 
-		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		conn, err := net.Dial("tcp", app.Srv.Listener.Addr().String())
 		assert.NilError(t, err)
 		defer conn.Close()
 
-		req := newTestRequest(t, "GET", "/status/100")
+		req := newTestRequest(t, "GET", app.URL("/status/100"), nil)
 		reqBytes, err := httputil.DumpRequestOut(req, false)
 		assert.NilError(t, err)
 
@@ -1139,9 +1240,8 @@ func TestStatus(t *testing.T) {
 
 		t.Run("ok", func(t *testing.T) {
 			t.Parallel()
-			req, _ := http.NewRequest("GET", srv.URL+"/status/200:0.7,429:0.2,503:0.1", nil)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/status/200:0.7,429:0.2,503:0.1"), nil)
+			resp := mustDoRequest(t, app, req)
 			if resp.StatusCode != 200 && resp.StatusCode != 429 && resp.StatusCode != 503 {
 				t.Fatalf("expected status code 200, 429, or 503, got %d", resp.StatusCode)
 			}
@@ -1149,27 +1249,28 @@ func TestStatus(t *testing.T) {
 
 		t.Run("bad weight", func(t *testing.T) {
 			t.Parallel()
-			req, _ := http.NewRequest("GET", srv.URL+"/status/200:foo,500:1", nil)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/status/200:foo,500:1"), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusBadRequest)
 		})
 
 		t.Run("bad choice", func(t *testing.T) {
 			t.Parallel()
-			req, _ := http.NewRequest("GET", srv.URL+"/status/200:1,foo:1", nil)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/status/200:1,foo:1"), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusBadRequest)
 		})
 	})
 }
 
 func TestUnstable(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_no_seed", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/unstable")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/unstable"), nil)
+		resp := mustDoRequest(t, app, req)
 		if resp.StatusCode != 200 && resp.StatusCode != 500 {
 			t.Fatalf("expected status code 200 or 500, got %d", resp.StatusCode)
 		}
@@ -1186,9 +1287,8 @@ func TestUnstable(t *testing.T) {
 	for _, test := range tests {
 		t.Run("ok_"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
@@ -1200,9 +1300,8 @@ func TestUnstable(t *testing.T) {
 	for _, test := range edgeCaseTests {
 		t.Run("bad"+test, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test), nil)
+			resp := mustDoRequest(t, app, req)
 			if resp.StatusCode != 200 && resp.StatusCode != 500 {
 				t.Fatalf("expected status code 200 or 500, got %d", resp.StatusCode)
 			}
@@ -1221,15 +1320,17 @@ func TestUnstable(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusBadRequest)
 		})
 	}
 }
 
 func TestResponseHeaders(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok", func(t *testing.T) {
 		t.Parallel()
 
@@ -1238,8 +1339,8 @@ func TestResponseHeaders(t *testing.T) {
 			"Bar": {"bar1", "bar2"},
 		}
 
-		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/response-headers?%s", srv.URL, wantHeaders.Encode()), nil)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/response-headers", wantHeaders), nil)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[http.Header](t, resp)
 
 		for k, expectedValues := range wantHeaders {
@@ -1268,8 +1369,8 @@ func TestResponseHeaders(t *testing.T) {
 		params := url.Values{}
 		params.Set("Content-Type", contentType)
 
-		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/response-headers?%s", srv.URL, params.Encode()), nil)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/response-headers", params), nil)
+		resp := mustDoRequest(t, app, req)
 
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.ContentType(t, resp, contentType)
@@ -1310,8 +1411,8 @@ func TestResponseHeaders(t *testing.T) {
 				params.Set("xss", dangerousString)
 				params.Set(dangerousString, "xss")
 
-				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/response-headers?%s", srv.URL, params.Encode()), nil)
-				resp := must.DoReq(t, client, req)
+				req := newTestRequest(t, "GET", app.URL("/response-headers", params), nil)
+				resp := mustDoRequest(t, app, req)
 
 				assert.StatusCode(t, resp, http.StatusOK)
 				if tc.contentType != "" {
@@ -1343,9 +1444,7 @@ func TestResponseHeaders(t *testing.T) {
 	t.Run("dangerously not escaping responses", func(t *testing.T) {
 		t.Parallel()
 
-		app := createApp(WithUnsafeAllowDangerousResponses())
-		srv := httptest.NewServer(app)
-		defer srv.Close()
+		app := setupTestApp(t, WithUnsafeAllowDangerousResponses())
 
 		dangerousString := "<img/src/onerror=alert('xss')>"
 
@@ -1353,8 +1452,8 @@ func TestResponseHeaders(t *testing.T) {
 		params.Set("Content-Type", "text/html")
 		params.Set("xss", dangerousString)
 
-		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/response-headers?%s", srv.URL, params.Encode()), nil)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/response-headers", params), nil)
+		resp := mustDoRequest(t, app, req)
 
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.ContentType(t, resp, "text/html")
@@ -1392,21 +1491,19 @@ func TestRedirects(t *testing.T) {
 		{"%s/absolute-redirect/100", "http://host/absolute-redirect/99%.s"},
 	}
 
-	for _, env := range envs {
+	for _, prefix := range []string{"", "/test-prefix"} {
+		app := setupTestApp(t, WithPrefix(prefix))
 		for _, test := range tests {
-			env := env
-			test := test
-			requestURL := fmt.Sprintf(test.requestURL, env.prefix)
-			t.Run("ok"+requestURL, func(t *testing.T) {
+			reqPath := fmt.Sprintf(test.requestURL, prefix)
+			t.Run("ok"+reqPath, func(t *testing.T) {
 				t.Parallel()
 
-				req := newTestRequest(t, "GET", requestURL, env)
+				req := newTestRequest(t, "GET", app.URL(reqPath), nil)
 				req.Host = "host"
-				resp := must.DoReq(t, env.client, req)
-				defer consumeAndCloseBody(resp)
+				resp := mustDoRequest(t, app, req)
 
 				assert.StatusCode(t, resp, http.StatusFound)
-				assert.Header(t, resp, "Location", fmt.Sprintf(test.expectedLocation, env.prefix))
+				assert.Header(t, resp, "Location", fmt.Sprintf(test.expectedLocation, prefix))
 			})
 		}
 	}
@@ -1437,16 +1534,14 @@ func TestRedirects(t *testing.T) {
 		{"%s/absolute-redirect/10/foo", http.StatusNotFound},
 	}
 
-	for _, env := range envs {
+	for _, prefix := range []string{"", "/test-prefix"} {
+		app := setupTestApp(t, WithPrefix(prefix))
 		for _, test := range errorTests {
-			env := env
-			test := test
-			requestURL := fmt.Sprintf(test.requestURL, env.prefix)
-			t.Run("error"+requestURL, func(t *testing.T) {
+			reqPath := fmt.Sprintf(test.requestURL, prefix)
+			t.Run("error"+reqPath, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, "GET", requestURL, env)
-				resp := must.DoReq(t, env.client, req)
-				defer consumeAndCloseBody(resp)
+				req := newTestRequest(t, "GET", app.URL(reqPath), nil)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, test.expectedStatus)
 			})
 		}
@@ -1454,6 +1549,14 @@ func TestRedirects(t *testing.T) {
 }
 
 func TestRedirectTo(t *testing.T) {
+	t.Parallel()
+
+	app := setupTestApp(t, WithAllowedRedirectDomains([]string{
+		"httpbingo.org",
+		"example.org",
+		"www.example.com",
+	}))
+
 	okTests := []struct {
 		url              string
 		expectedLocation string
@@ -1464,16 +1567,13 @@ func TestRedirectTo(t *testing.T) {
 
 		{"/redirect-to?url=/get", "/get", http.StatusFound},
 		{"/redirect-to?url=/get&status_code=307", "/get", http.StatusTemporaryRedirect},
-
-		{"/redirect-to?url=foo", "foo", http.StatusFound},
 	}
 
 	for _, test := range okTests {
 		t.Run("ok"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 			assert.Header(t, resp, "Location", test.expectedLocation)
 		})
@@ -1485,17 +1585,17 @@ func TestRedirectTo(t *testing.T) {
 	}{
 		{"/redirect-to", http.StatusBadRequest},                                               // missing url
 		{"/redirect-to?status_code=302", http.StatusBadRequest},                               // missing url
-		{"/redirect-to?url=foo&status_code=201", http.StatusBadRequest},                       // invalid status code
-		{"/redirect-to?url=foo&status_code=418", http.StatusBadRequest},                       // invalid status code
-		{"/redirect-to?url=foo&status_code=foo", http.StatusBadRequest},                       // invalid status code
+		{"/redirect-to?url=/get&status_code=201", http.StatusBadRequest},                      // invalid status code
+		{"/redirect-to?url=/get&status_code=418", http.StatusBadRequest},                      // invalid status code
+		{"/redirect-to?url=/get&status_code=/get", http.StatusBadRequest},                     // invalid status code
 		{"/redirect-to?url=http%3A%2F%2Ffoo%25%25bar&status_code=418", http.StatusBadRequest}, // invalid URL
+		{"/redirect-to?url=foo", http.StatusForbidden},                                        // relative target URL must be root-relative or is considered malicious
 	}
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
@@ -1512,40 +1612,55 @@ func TestRedirectTo(t *testing.T) {
 
 		// See https://github.com/mccutchen/go-httpbin/issues/173
 		{"/redirect-to?url=//evil.com", http.StatusForbidden}, // missing scheme to attempt to bypass allowlist
+
+		// Percent-encoded scheme/host used to smuggle a disallowed domain
+		// past the allowlist check.
+		{"/redirect-to?url=http%3A%2F%2Fevil.com", http.StatusForbidden},       // single-encoded
+		{"/redirect-to?url=http%253A%252F%252Fevil.com", http.StatusForbidden}, // double-encoded
+
+		// Malicious requests from live httpbingo traffic
+		{"/redirect-to?url=http%253A//%255B%253A%253Affff%253A169.254.169.254%255D/latest/meta-data/", http.StatusForbidden},
+		{"/redirect-to?url=http%253A%252F%252F169.254.169.254%252Flatest%252Fmeta-data%252Fiam%252Fsecurity-credentials%252F", http.StatusForbidden},
+		{"/redirect-to?url=http%253A%252F%252Flocalhost%253A8080%252Factuator%252Fenv&status_code=302", http.StatusForbidden},
 	}
 	for _, test := range allowListTests {
 		t.Run("allowlist"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 			if test.expectedStatus >= 400 {
-				assert.BodyEquals(t, resp, app.forbiddenRedirectError)
+				assert.BodyEquals(t, resp, app.App.forbiddenRedirectError)
 			}
 		})
 	}
 }
 
 func TestCookies(t *testing.T) {
-	for _, env := range envs {
-		t.Run("get"+env.prefix, func(t *testing.T) {
+	for _, prefix := range []string{"", "/test-prefix"} {
+		app := setupTestApp(t, WithPrefix(prefix))
+
+		t.Run("get"+prefix, func(t *testing.T) {
 			testCases := map[string]struct {
 				cookies cookiesResponse
 			}{
 				"ok/no cookies": {
-					cookies: cookiesResponse{},
+					cookies: cookiesResponse{Cookies: map[string]string{}},
 				},
 				"ok/one cookie": {
 					cookies: cookiesResponse{
-						"k1": "v1",
+						Cookies: map[string]string{
+							"k1": "v1",
+						},
 					},
 				},
 				"ok/many cookies": {
 					cookies: cookiesResponse{
-						"k1": "v1",
-						"k2": "v2",
-						"k3": "v3",
+						Cookies: map[string]string{
+							"k1": "v1",
+							"k2": "v2",
+							"k3": "v3",
+						},
 					},
 				},
 			}
@@ -1554,98 +1669,234 @@ func TestCookies(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					t.Parallel()
 
-					req := newTestRequest(t, "GET", env.prefix+"/cookies", env)
-					for k, v := range tc.cookies {
+					req := newTestRequest(t, "GET", app.URL(prefix+"/cookies"), nil)
+					for k, v := range tc.cookies.Cookies {
 						req.AddCookie(&http.Cookie{
 							Name:  k,
 							Value: v,
 						})
 					}
 
-					resp := must.DoReq(t, env.client, req)
-					defer consumeAndCloseBody(resp)
-
+					resp := mustDoRequest(t, app, req)
 					result := mustParseResponse[cookiesResponse](t, resp)
 					assert.DeepEqual(t, result, tc.cookies, "cookies mismatch")
 				})
 			}
 		})
 
-		t.Run("set"+env.prefix, func(t *testing.T) {
+		t.Run("set"+prefix, func(t *testing.T) {
 			t.Parallel()
 
-			cookies := cookiesResponse{
-				"k1": "v1",
-				"k2": "v2",
+			testCases := map[string]struct {
+				params       url.Values
+				headers      http.Header
+				wantDomain   string
+				wantHTTPOnly bool
+				wantPath     string
+				wantSameSite http.SameSite
+				wantSecure   bool
+			}{
+				"defaults/http": {
+					params:       url.Values{"k1": {"v1"}, "k2": {"v2"}},
+					wantHTTPOnly: true,
+					wantPath:     "/",
+				},
+				"defaults/https": {
+					params:       url.Values{"k": {"v"}},
+					headers:      http.Header{"X-Forwarded-Proto": {"https"}},
+					wantHTTPOnly: true,
+					wantPath:     "/",
+					wantSecure:   true,
+				},
+				"defaults/https via X-Forwarded-Ssl": {
+					params:       url.Values{"k": {"v"}},
+					headers:      http.Header{"X-Forwarded-Ssl": {"on"}},
+					wantHTTPOnly: true,
+					wantPath:     "/",
+					wantSecure:   true,
+				},
+				"defaults/https via X-Forwarded-Protocol": {
+					params:       url.Values{"k": {"v"}},
+					headers:      http.Header{"X-Forwarded-Protocol": {"https"}},
+					wantHTTPOnly: true,
+					wantPath:     "/",
+					wantSecure:   true,
+				},
+				"attr[Secure]=true": {
+					params:       url.Values{"k": {"v"}, "attr[Secure]": {"true"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: true,
+				},
+				"attr[Secure]=1": {
+					params:       url.Values{"k": {"v"}, "attr[Secure]": {"1"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: true,
+				},
+				"attr[Secure]=false overrides https": {
+					params:       url.Values{"k": {"v"}, "attr[Secure]": {"false"}},
+					headers:      http.Header{"X-Forwarded-Proto": {"https"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: false,
+				},
+				"attr[Secure]=bananas is false": {
+					params:       url.Values{"k": {"v"}, "attr[Secure]": {"bananas"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: false,
+				},
+				"attr[HttpOnly]=false": {
+					params:       url.Values{"k": {"v"}, "attr[HttpOnly]": {"false"}},
+					wantHTTPOnly: false, wantPath: "/",
+				},
+				"attr[HttpOnly]=0 is false": {
+					params:       url.Values{"k": {"v"}, "attr[HttpOnly]": {"0"}},
+					wantHTTPOnly: false, wantPath: "/",
+				},
+				"attr[Path]=/custom": {
+					params:       url.Values{"k": {"v"}, "attr[Path]": {"/custom"}},
+					wantHTTPOnly: true, wantPath: "/custom",
+				},
+				"attr[Domain]=example.com": {
+					params:     url.Values{"k": {"v"}, "attr[Domain]": {"example.com"}},
+					wantDomain: "example.com", wantHTTPOnly: true, wantPath: "/",
+				},
+				"attr[SameSite]=strict": {
+					params:       url.Values{"k": {"v"}, "attr[SameSite]": {"strict"}},
+					wantHTTPOnly: true, wantPath: "/", wantSameSite: http.SameSiteStrictMode,
+				},
+				"attr[SameSite]=lax": {
+					params:       url.Values{"k": {"v"}, "attr[SameSite]": {"lax"}},
+					wantHTTPOnly: true, wantPath: "/", wantSameSite: http.SameSiteLaxMode,
+				},
+				"attr[SameSite]=none": {
+					params:       url.Values{"k": {"v"}, "attr[SameSite]": {"none"}},
+					wantHTTPOnly: true, wantPath: "/", wantSameSite: http.SameSiteNoneMode,
+				},
+				"attr[SameSite]=invalid is omitted": {
+					params:       url.Values{"k": {"v"}, "attr[SameSite]": {"bogus"}},
+					wantHTTPOnly: true, wantPath: "/",
+				},
+				"attr names are case-insensitive": {
+					params:     url.Values{"k": {"v"}, "attr[secure]": {"true"}, "attr[httponly]": {"false"}, "attr[path]": {"/x"}, "attr[DOMAIN]": {"a.com"}, "attr[SameSite]": {"Lax"}},
+					wantDomain: "a.com", wantHTTPOnly: false, wantPath: "/x", wantSameSite: http.SameSiteLaxMode, wantSecure: true,
+				},
 			}
-			params := &url.Values{}
-			for k, v := range cookies {
-				params.Set(k, v)
-			}
 
-			req := newTestRequest(t, "GET", env.prefix+"/cookies/set?"+params.Encode(), env)
-			resp := must.DoReq(t, client, req)
+			for name, tc := range testCases {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
 
-			assert.StatusCode(t, resp, http.StatusFound)
-			assert.Header(t, resp, "Location", env.prefix+"/cookies")
+					req := newTestRequest(t, "GET", app.URL(prefix+"/cookies/set", tc.params), nil)
+					for k, v := range tc.headers {
+						req.Header[k] = v
+					}
 
-			for _, c := range resp.Cookies() {
-				v, ok := cookies[c.Name]
-				if !ok {
-					t.Fatalf("got unexpected cookie %s=%s", c.Name, c.Value)
-				}
-				assert.Equal(t, v, c.Value, "value mismatch for cookie %q", c.Name)
+					resp := mustDoRequest(t, app, req)
+					assert.StatusCode(t, resp, http.StatusFound)
+					assert.Header(t, resp, "Location", prefix+"/cookies")
+
+					for _, c := range resp.Cookies() {
+						if isCookieAttrParam(c.Name) {
+							t.Fatalf("unexpected cookie with attr param name %q", c.Name)
+						}
+						assert.Equal(t, tc.wantDomain, c.Domain, "Domain mismatch for cookie %q", c.Name)
+						assert.Equal(t, tc.wantHTTPOnly, c.HttpOnly, "HttpOnly mismatch for cookie %q", c.Name)
+						assert.Equal(t, tc.wantPath, c.Path, "Path mismatch for cookie %q", c.Name)
+						assert.Equal(t, tc.wantSameSite, c.SameSite, "SameSite mismatch for cookie %q", c.Name)
+						assert.Equal(t, tc.wantSecure, c.Secure, "Secure mismatch for cookie %q", c.Name)
+					}
+				})
 			}
 		})
 
-		t.Run("delete"+env.prefix, func(t *testing.T) {
+		t.Run("delete"+prefix, func(t *testing.T) {
 			t.Parallel()
 
-			cookies := cookiesResponse{
-				"k1": "v1",
-				"k2": "v2",
+			testCases := map[string]struct {
+				params       url.Values
+				headers      http.Header
+				wantDomain   string
+				wantHTTPOnly bool
+				wantPath     string
+				wantSecure   bool
+			}{
+				"defaults/http": {
+					params:       url.Values{"k2": {""}},
+					wantHTTPOnly: true,
+					wantPath:     "/",
+				},
+				"defaults/https": {
+					params:       url.Values{"k2": {""}},
+					headers:      http.Header{"X-Forwarded-Proto": {"https"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: true,
+				},
+				"attr[Secure]=true": {
+					params:       url.Values{"k2": {""}, "attr[Secure]": {"true"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: true,
+				},
+				"attr[Secure]=false overrides https": {
+					params:       url.Values{"k2": {""}, "attr[Secure]": {"false"}},
+					headers:      http.Header{"X-Forwarded-Proto": {"https"}},
+					wantHTTPOnly: true, wantPath: "/", wantSecure: false,
+				},
+				"attr[Domain]=example.com": {
+					params:     url.Values{"k2": {""}, "attr[Domain]": {"example.com"}},
+					wantDomain: "example.com", wantHTTPOnly: true, wantPath: "/",
+				},
+				"attr[Path]=/custom": {
+					params:       url.Values{"k2": {""}, "attr[Path]": {"/custom"}},
+					wantHTTPOnly: true, wantPath: "/custom",
+				},
 			}
 
-			toDelete := "k2"
-			params := &url.Values{}
-			params.Set(toDelete, "")
+			for name, tc := range testCases {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
 
-			req := newTestRequest(t, "GET", env.prefix+"/cookies/delete?"+params.Encode(), env)
-			for k, v := range cookies {
-				req.AddCookie(&http.Cookie{
-					Name:  k,
-					Value: v,
-				})
-			}
-
-			resp := must.DoReq(t, env.client, req)
-			assert.StatusCode(t, resp, http.StatusFound)
-			assert.Header(t, resp, "Location", env.prefix+"/cookies")
-
-			for _, c := range resp.Cookies() {
-				if c.Name == toDelete {
-					if time.Since(c.Expires) < (24*365-1)*time.Hour {
-						t.Fatalf("expected cookie %s to be deleted; got %#v", toDelete, c)
+					toDelete := "k2"
+					req := newTestRequest(t, "GET", app.URL(prefix+"/cookies/delete", tc.params), nil)
+					req.AddCookie(&http.Cookie{Name: "k1", Value: "v1"})
+					req.AddCookie(&http.Cookie{Name: toDelete, Value: "v2"})
+					for k, v := range tc.headers {
+						req.Header[k] = v
 					}
-				}
+
+					resp := mustDoRequest(t, app, req)
+					assert.StatusCode(t, resp, http.StatusFound)
+					assert.Header(t, resp, "Location", prefix+"/cookies")
+
+					for _, c := range resp.Cookies() {
+						if isCookieAttrParam(c.Name) {
+							t.Fatalf("unexpected cookie with attr param name %q", c.Name)
+						}
+						if c.Name == toDelete {
+							if time.Since(c.Expires) < (24*365-1)*time.Hour {
+								t.Fatalf("expected cookie %s to be deleted; got %#v", toDelete, c)
+							}
+							assert.Equal(t, tc.wantDomain, c.Domain, "Domain mismatch")
+							assert.Equal(t, tc.wantHTTPOnly, c.HttpOnly, "HttpOnly mismatch")
+							assert.Equal(t, tc.wantPath, c.Path, "Path mismatch")
+							assert.Equal(t, tc.wantSecure, c.Secure, "Secure mismatch")
+						}
+					}
+				})
 			}
 		})
 	}
 }
 
 func TestBasicAuth(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok", func(t *testing.T) {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH"} {
 			t.Run(method, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, method, "/basic-auth/user/pass")
+				req := newTestRequest(t, method, app.URL("/basic-auth/user/pass"), nil)
 				req.SetBasicAuth("user", "pass")
 
-				resp := must.DoReq(t, client, req)
+				resp := mustDoRequest(t, app, req)
 				result := mustParseResponse[authResponse](t, resp)
 				expectedResult := authResponse{
-					Authorized: true,
-					User:       "user",
+					Authenticated: true,
+					Authorized:    true,
+					User:          "user",
 				}
 				assert.DeepEqual(t, result, expectedResult, "expected authorized user")
 			})
@@ -1656,16 +1907,17 @@ func TestBasicAuth(t *testing.T) {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH"} {
 			t.Run(method, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, method, "/basic-auth/user/pass")
-				resp := must.DoReq(t, client, req)
+				req := newTestRequest(t, method, app.URL("/basic-auth/user/pass"), nil)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, http.StatusUnauthorized)
 				assert.ContentType(t, resp, jsonContentType)
 				assert.Header(t, resp, "WWW-Authenticate", `Basic realm="Fake Realm"`)
 
 				result := must.Unmarshal[authResponse](t, resp.Body)
 				expectedResult := authResponse{
-					Authorized: false,
-					User:       "",
+					Authenticated: false,
+					Authorized:    false,
+					User:          "",
 				}
 				assert.DeepEqual(t, result, expectedResult, "expected unauthorized user")
 			})
@@ -1676,18 +1928,19 @@ func TestBasicAuth(t *testing.T) {
 		for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH"} {
 			t.Run(method, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, method, "/basic-auth/user/pass")
+				req := newTestRequest(t, method, app.URL("/basic-auth/user/pass"), nil)
 				req.SetBasicAuth("bad", "auth")
 
-				resp := must.DoReq(t, client, req)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, http.StatusUnauthorized)
 				assert.ContentType(t, resp, jsonContentType)
 				assert.Header(t, resp, "WWW-Authenticate", `Basic realm="Fake Realm"`)
 
 				result := must.Unmarshal[authResponse](t, resp.Body)
 				expectedResult := authResponse{
-					Authorized: false,
-					User:       "bad",
+					Authenticated: false,
+					Authorized:    false,
+					User:          "bad",
 				}
 				assert.DeepEqual(t, result, expectedResult, "expected unauthorized user")
 			})
@@ -1705,44 +1958,47 @@ func TestBasicAuth(t *testing.T) {
 	for _, test := range errorTests {
 		t.Run("error"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
 			req.SetBasicAuth("foo", "bar")
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
 }
 
 func TestHiddenBasicAuth(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok", func(t *testing.T) {
 		t.Parallel()
 
-		req := newTestRequest(t, "GET", "/hidden-basic-auth/user/pass")
+		req := newTestRequest(t, "GET", app.URL("/hidden-basic-auth/user/pass"), nil)
 		req.SetBasicAuth("user", "pass")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[authResponse](t, resp)
 		expectedResult := authResponse{
-			Authorized: true,
-			User:       "user",
+			Authenticated: true,
+			Authorized:    true,
+			User:          "user",
 		}
 		assert.DeepEqual(t, result, expectedResult, "expected authorized user")
 	})
 
 	t.Run("error/no auth", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/hidden-basic-auth/user/pass")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL("/hidden-basic-auth/user/pass"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusNotFound)
 		assert.Header(t, resp, "WWW-Authenticate", "")
 	})
 
 	t.Run("error/bad auth", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/hidden-basic-auth/user/pass")
+		req := newTestRequest(t, "GET", app.URL("/hidden-basic-auth/user/pass"), nil)
 		req.SetBasicAuth("bad", "auth")
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusNotFound)
 		assert.Header(t, resp, "WWW-Authenticate", "")
 	})
@@ -1758,16 +2014,18 @@ func TestHiddenBasicAuth(t *testing.T) {
 	for _, test := range errorTests {
 		t.Run("error"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
 			req.SetBasicAuth("foo", "bar")
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
 }
 
 func TestDigestAuth(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	tests := []struct {
 		url    string
 		status int
@@ -1789,9 +2047,8 @@ func TestDigestAuth(t *testing.T) {
 	for _, test := range tests {
 		t.Run("ok"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
@@ -1813,14 +2070,15 @@ func TestDigestAuth(t *testing.T) {
 			`cnonce="aaab705226af5bd4"`,
 		}, ", ")
 
-		req := newTestRequest(t, "GET", "/digest-auth/auth/user/pass/MD5")
+		req := newTestRequest(t, "GET", app.URL("/digest-auth/auth/user/pass/MD5"), nil)
 		req.Header.Set("Authorization", authorization)
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[authResponse](t, resp)
 		expectedResult := authResponse{
-			Authorized: true,
-			User:       "user",
+			Authenticated: true,
+			Authorized:    true,
+			User:          "user",
 		}
 		assert.DeepEqual(t, result, expectedResult, "expected authorized user")
 	})
@@ -1829,10 +2087,11 @@ func TestDigestAuth(t *testing.T) {
 func TestGzip(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/gzip")
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/gzip"), nil)
 	req.Header.Set("Accept-Encoding", "none") // disable automagic gzip decompression in default http client
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.Header(t, resp, "Content-Encoding", "gzip")
 	assert.ContentType(t, resp, jsonContentType)
 	assert.StatusCode(t, resp, http.StatusOK)
@@ -1862,8 +2121,9 @@ func TestGzip(t *testing.T) {
 func TestDeflate(t *testing.T) {
 	t.Parallel()
 
-	req := newTestRequest(t, "GET", "/deflate")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/deflate"), nil)
+	resp := mustDoRequest(t, app, req)
 
 	assert.ContentType(t, resp, jsonContentType)
 	assert.Header(t, resp, "Content-Encoding", "deflate")
@@ -1894,6 +2154,8 @@ func TestDeflate(t *testing.T) {
 func TestStream(t *testing.T) {
 	t.Parallel()
 
+	app := setupTestApp(t)
+
 	okTests := []struct {
 		url           string
 		expectedLines int
@@ -1908,9 +2170,8 @@ func TestStream(t *testing.T) {
 		t.Run("ok"+test.url, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 
 			// Expect empty content-length due to streaming response
 			assert.Header(t, resp, "Content-Length", "")
@@ -1940,9 +2201,8 @@ func TestStream(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
@@ -1950,6 +2210,8 @@ func TestStream(t *testing.T) {
 
 func TestTrailers(t *testing.T) {
 	t.Parallel()
+
+	app := setupTestApp(t)
 
 	testCases := []struct {
 		url          string
@@ -1977,8 +2239,8 @@ func TestTrailers(t *testing.T) {
 		t.Run(tc.url, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, "GET", tc.url)
-			resp := must.DoReq(t, client, req)
+			req := newTestRequest(t, "GET", app.URL(tc.url), nil)
+			resp := mustDoRequest(t, app, req)
 
 			assert.StatusCode(t, resp, tc.wantStatus)
 			if tc.wantStatus != http.StatusOK {
@@ -2002,6 +2264,7 @@ func TestTrailers(t *testing.T) {
 
 func TestDelay(t *testing.T) {
 	t.Parallel()
+	app := setupTestApp(t)
 
 	okTests := []struct {
 		url           string
@@ -2009,23 +2272,21 @@ func TestDelay(t *testing.T) {
 	}{
 		// go-style durations are supported
 		{"/delay/0ms", 0},
-		{"/delay/500ms", 500 * time.Millisecond},
+		{"/delay/100ms", 100 * time.Millisecond},
 
 		// as are floating point seconds
 		{"/delay/0", 0},
-		{"/delay/0.5", 500 * time.Millisecond},
-		{"/delay/1", maxDuration},
+		{"/delay/0.1", 100 * time.Millisecond},
 	}
 	for _, test := range okTests {
 		t.Run("ok"+test.url, func(t *testing.T) {
 			t.Parallel()
 
 			start := time.Now()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			elapsed := time.Since(start)
 
-			defer consumeAndCloseBody(resp)
 			_ = mustParseResponse[bodyResponse](t, resp)
 
 			if elapsed < test.expectedDelay {
@@ -2045,8 +2306,8 @@ func TestDelay(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
 
-		req := newTestRequest(t, "GET", "/delay/1").WithContext(ctx)
-		_, err := client.Do(req)
+		req := newTestRequest(t, "GET", app.URL("/delay/1"), nil).WithContext(ctx)
+		_, err := app.Client.Do(req)
 		if !os.IsTimeout(err) {
 			t.Errorf("expected timeout error, got %v", err)
 		}
@@ -2062,7 +2323,7 @@ func TestDelay(t *testing.T) {
 		// because only the former will let us inspect the status code.
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequestWithContext(ctx, "GET", "/delay/1s", nil)
-		app.ServeHTTP(w, req)
+		app.App.ServeHTTP(w, req)
 		assert.Equal(t, w.Code, 499, "incorrect status code")
 	})
 
@@ -2084,9 +2345,8 @@ func TestDelay(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
@@ -2095,49 +2355,53 @@ func TestDelay(t *testing.T) {
 func TestDrip(t *testing.T) {
 	t.Parallel()
 
+	var (
+		maxBodySize = 1024
+		opts        = []OptionFunc{
+			WithMaxBodySize(int64(maxBodySize)),
+		}
+		app = setupTestApp(t, opts...)
+	)
+
 	okTests := []struct {
-		params   *url.Values
+		params   url.Values
 		duration time.Duration
 		numbytes int
 		code     int
 	}{
 		// there are useful defaults for all values
-		{&url.Values{}, 0, 10, http.StatusOK},
+		{url.Values{}, 0, 10, http.StatusOK},
 
 		// go-style durations are accepted
-		{&url.Values{"duration": {"5ms"}}, 5 * time.Millisecond, 10, http.StatusOK},
-		{&url.Values{"duration": {"0h"}}, 0, 10, http.StatusOK},
-		{&url.Values{"delay": {"5ms"}}, 5 * time.Millisecond, 10, http.StatusOK},
-		{&url.Values{"delay": {"0h"}}, 0, 10, http.StatusOK},
+		{url.Values{"duration": {"5ms"}}, 5 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"duration": {"0h"}}, 0, 10, http.StatusOK},
+		{url.Values{"delay": {"5ms"}}, 5 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"delay": {"0h"}}, 0, 10, http.StatusOK},
 
 		// or floating point seconds
-		{&url.Values{"duration": {"0.25"}}, 250 * time.Millisecond, 10, http.StatusOK},
-		{&url.Values{"duration": {"0"}}, 0, 10, http.StatusOK},
-		{&url.Values{"duration": {"1"}}, 1 * time.Second, 10, http.StatusOK},
-		{&url.Values{"delay": {"0.25"}}, 250 * time.Millisecond, 10, http.StatusOK},
-		{&url.Values{"delay": {"0"}}, 0, 10, http.StatusOK},
+		{url.Values{"duration": {"0.1"}}, 100 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"duration": {"0"}}, 0, 10, http.StatusOK},
+		{url.Values{"delay": {"0.1"}}, 100 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"delay": {"0"}}, 0, 10, http.StatusOK},
 
-		{&url.Values{"numbytes": {"1"}}, 0, 1, http.StatusOK},
-		{&url.Values{"numbytes": {"101"}}, 0, 101, http.StatusOK},
-		{&url.Values{"numbytes": {fmt.Sprintf("%d", maxBodySize)}}, 0, int(maxBodySize), http.StatusOK},
+		{url.Values{"numbytes": {"1"}}, 0, 1, http.StatusOK},
+		{url.Values{"numbytes": {"101"}}, 0, 101, http.StatusOK},
+		{url.Values{"numbytes": {fmt.Sprintf("%d", maxBodySize)}}, 0, maxBodySize, http.StatusOK},
 
-		{&url.Values{"code": {"404"}}, 0, 10, http.StatusNotFound},
-		{&url.Values{"code": {"599"}}, 0, 10, 599},
-		{&url.Values{"code": {"567"}}, 0, 10, 567},
+		{url.Values{"code": {"404"}}, 0, 10, http.StatusNotFound},
+		{url.Values{"code": {"599"}}, 0, 10, 599},
+		{url.Values{"code": {"567"}}, 0, 10, 567},
 
-		{&url.Values{"duration": {"250ms"}, "delay": {"250ms"}}, 500 * time.Millisecond, 10, http.StatusOK},
-		{&url.Values{"duration": {"250ms"}, "delay": {"0.25s"}}, 500 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"duration": {"100ms"}, "delay": {"100ms"}}, 200 * time.Millisecond, 10, http.StatusOK},
+		{url.Values{"duration": {"100ms"}, "delay": {"0.1"}}, 200 * time.Millisecond, 10, http.StatusOK},
 	}
 	for _, test := range okTests {
 		t.Run(fmt.Sprintf("ok/%s", test.params.Encode()), func(t *testing.T) {
 			t.Parallel()
 
-			url := "/drip?" + test.params.Encode()
-
 			start := time.Now()
-			req := newTestRequest(t, "GET", url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/drip", test.params), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.BodySize(t, resp, test.numbytes) // must read body before measuring elapsed time
 			elapsed := time.Since(start)
 
@@ -2168,11 +2432,11 @@ func TestDrip(t *testing.T) {
 		// indication we need.
 		t.Parallel()
 
-		req := newTestRequest(t, "GET", "/drip?code=100")
+		req := newTestRequest(t, "GET", app.URL("/drip?code=100"), nil)
 		reqBytes, err := httputil.DumpRequestOut(req, false)
 		assert.NilError(t, err)
 
-		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		conn, err := net.Dial("tcp", app.Srv.Listener.Addr().String())
 		assert.NilError(t, err)
 		defer conn.Close()
 
@@ -2189,50 +2453,39 @@ func TestDrip(t *testing.T) {
 		t.Parallel()
 
 		var (
-			duration = 100 * time.Millisecond
+			duration = 500 * time.Millisecond
 			numBytes = 3
 			endpoint = fmt.Sprintf("/drip?duration=%s&numbytes=%d", duration, numBytes)
-
-			// Match server logic for calculating the delay between writes
-			wantPauseBetweenWrites = duration / time.Duration(numBytes-1)
 		)
-		req := newTestRequest(t, "GET", endpoint)
-		resp := must.DoReq(t, client, req)
-		defer consumeAndCloseBody(resp)
 
-		// Here we read from the response one byte at a time, and ensure that
-		// at least the expected delay occurs for each read.
-		//
-		// The request above includes an initial delay equal to the expected
-		// wait between writes so that even the first iteration of this loop
-		// expects to wait the same amount of time for a read.
+		// start timer before sending the request to ensure the client
+		// duration measurement is at least as long as the server's duration,
+		// to avoid flakiness
+		start := time.Now()
+		req := newTestRequest(t, "GET", app.URL(endpoint), nil)
+		resp := mustDoRequest(t, app, req)
+
+		// read incremental writes in a loop. should read one byte at a time,
+		// despite the larger read buffer.
 		buf := make([]byte, 1024)
 		gotBody := make([]byte, 0, numBytes)
-		for i := 0; ; i++ {
-			start := time.Now()
+		numReads := 0
+		for {
 			n, err := resp.Body.Read(buf)
-			gotPause := time.Since(start)
-
-			// We expect to read exactly one byte on each iteration. On the
-			// last iteration, we expct to hit EOF after reading the final
-			// byte, because the server does not pause after the last write.
 			assert.Equal(t, n, 1, "incorrect number of bytes read")
 			assert.DeepEqual(t, buf[:n], []byte{'*'}, "unexpected bytes read")
 			gotBody = append(gotBody, buf[:n]...)
-
+			numReads++
 			if err == io.EOF {
 				break
 			}
-
 			assert.NilError(t, err)
-
-			// only ensure that we pause for the expected time between writes
-			// (allowing for minor mismatch in local timers and server timers)
-			// after the first byte.
-			if i > 0 {
-				assert.RoughlyEqual(t, gotPause, wantPauseBetweenWrites, 3*time.Millisecond)
-			}
 		}
+
+		// writes were incrmemental if a) we did one read per byte and b)
+		// reading the whole response took (at least) the expected duration
+		assert.Equal(t, numReads, numBytes, "incorrect read count")
+		assert.MinDuration(t, time.Since(start), duration)
 
 		wantBody := bytes.Repeat([]byte{'*'}, numBytes)
 		assert.DeepEqual(t, gotBody, wantBody, "incorrect body")
@@ -2248,8 +2501,8 @@ func TestDrip(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 		defer cancel()
 
-		req := newTestRequest(t, "GET", "/drip?duration=500ms&delay=500ms").WithContext(ctx)
-		if _, err := client.Do(req); !os.IsTimeout(err) {
+		req := newTestRequest(t, "GET", app.URL("/drip?duration=500ms&delay=500ms"), nil).WithContext(ctx)
+		if _, err := app.Client.Do(req); !os.IsTimeout(err) {
 			t.Fatalf("expected timeout error, got %s", err)
 		}
 	})
@@ -2260,9 +2513,8 @@ func TestDrip(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		defer cancel()
 
-		req := newTestRequest(t, "GET", "/drip?duration=900ms&delay=100ms").WithContext(ctx)
-		resp := must.DoReq(t, client, req)
-		defer consumeAndCloseBody(resp)
+		req := newTestRequest(t, "GET", app.URL("/drip?duration=900ms&delay=100ms"), nil).WithContext(ctx)
+		resp := mustDoRequest(t, app, req)
 
 		// In this test, the server should have started an OK response before
 		// our client timeout cancels the request, so we should get an OK here.
@@ -2281,50 +2533,48 @@ func TestDrip(t *testing.T) {
 	})
 
 	badTests := []struct {
-		params *url.Values
+		params url.Values
 		code   int
 	}{
-		{&url.Values{"duration": {"1m"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"-1ms"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"1001"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"1m"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"-1ms"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"1001"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"foo"}}, http.StatusBadRequest},
 
-		{&url.Values{"delay": {"1m"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"-1ms"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"1001"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"1m"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"-1ms"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"1001"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"foo"}}, http.StatusBadRequest},
 
-		{&url.Values{"numbytes": {"foo"}}, http.StatusBadRequest},
-		{&url.Values{"numbytes": {"0"}}, http.StatusBadRequest},
-		{&url.Values{"numbytes": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"numbytes": {"0xff"}}, http.StatusBadRequest},
-		{&url.Values{"numbytes": {fmt.Sprintf("%d", maxBodySize+1)}}, http.StatusBadRequest},
+		{url.Values{"numbytes": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"numbytes": {"0"}}, http.StatusBadRequest},
+		{url.Values{"numbytes": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"numbytes": {"0xff"}}, http.StatusBadRequest},
+		{url.Values{"numbytes": {fmt.Sprintf("%d", maxBodySize+1)}}, http.StatusBadRequest},
 
-		{&url.Values{"code": {"foo"}}, http.StatusBadRequest},
-		{&url.Values{"code": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"code": {"25"}}, http.StatusBadRequest},
-		{&url.Values{"code": {"600"}}, http.StatusBadRequest},
+		{url.Values{"code": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"code": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"code": {"25"}}, http.StatusBadRequest},
+		{url.Values{"code": {"600"}}, http.StatusBadRequest},
 
 		// request would take too long
-		{&url.Values{"duration": {"750ms"}, "delay": {"500ms"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"750ms"}, "delay": {"500ms"}}, http.StatusBadRequest},
 	}
 	for _, test := range badTests {
 		t.Run(fmt.Sprintf("bad/%s", test.params.Encode()), func(t *testing.T) {
 			t.Parallel()
-			url := "/drip?" + test.params.Encode()
-			req := newTestRequest(t, "GET", url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/drip", test.params), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
 
 	t.Run("ensure HEAD request works with streaming responses", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "HEAD", "/drip?duration=900ms&delay=100ms")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "HEAD", app.URL("/drip?duration=900ms&delay=100ms"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.BodySize(t, resp, 0)
 	})
@@ -2339,9 +2589,8 @@ func TestDrip(t *testing.T) {
 		)
 
 		url := fmt.Sprintf("/drip?duration=%s&delay=%s&numbytes=%d", duration, delay, numBytes)
-		req := newTestRequest(t, "GET", url)
-		resp := must.DoReq(t, client, req)
-		defer consumeAndCloseBody(resp)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
 
 		assert.StatusCode(t, resp, http.StatusOK)
 
@@ -2363,14 +2612,17 @@ func TestDrip(t *testing.T) {
 }
 
 func TestRange(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_no_range", func(t *testing.T) {
 		t.Parallel()
 
-		wantBytes := maxBodySize - 1
+		wantBytes := app.cfg.MaxBodySize - 1
 		url := fmt.Sprintf("/range/%d", wantBytes)
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.Header(t, resp, "ETag", fmt.Sprintf("range%d", wantBytes))
 		assert.Header(t, resp, "Accept-Ranges", "bytes")
@@ -2383,10 +2635,10 @@ func TestRange(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/100"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=10-24")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range100")
 		assert.Header(t, resp, "Accept-Ranges", "bytes")
@@ -2400,10 +2652,10 @@ func TestRange(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/1000"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=0-15")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range1000")
 		assert.Header(t, resp, "Accept-Ranges", "bytes")
@@ -2416,10 +2668,10 @@ func TestRange(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/26"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=20-")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range26")
 		assert.Header(t, resp, "Content-Length", "6")
@@ -2431,10 +2683,10 @@ func TestRange(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/26"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=-5")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		t.Logf("headers = %v", resp.Header)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range26")
@@ -2445,13 +2697,13 @@ func TestRange(t *testing.T) {
 
 	t.Run("ok_range_with_duration", func(t *testing.T) {
 		t.Parallel()
-
+		app := setupTestApp(t)
 		url := "/range/100?duration=100ms"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=10-24")
 
 		start := time.Now()
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		elapsed := time.Since(start)
 
 		assert.StatusCode(t, resp, http.StatusPartialContent)
@@ -2461,17 +2713,17 @@ func TestRange(t *testing.T) {
 		assert.Header(t, resp, "Content-Range", "bytes 10-24/100")
 		assert.Header(t, resp, "Content-Type", textContentType)
 		assert.BodyEquals(t, resp, "klmnopqrstuvwxy")
-		assert.DurationRange(t, elapsed, 100*time.Millisecond, 150*time.Millisecond)
+		assert.MinDuration(t, elapsed, 15*time.Millisecond)
 	})
 
 	t.Run("ok_multiple_ranges", func(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/100"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=10-24, 50-64")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range100")
 		assert.Header(t, resp, "Accept-Ranges", "bytes")
@@ -2510,10 +2762,10 @@ func TestRange(t *testing.T) {
 		t.Parallel()
 
 		url := "/range/26"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Add("Range", "bytes=-5")
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusPartialContent)
 		assert.Header(t, resp, "ETag", "range26")
 		assert.Header(t, resp, "Content-Length", "5")
@@ -2534,9 +2786,8 @@ func TestRange(t *testing.T) {
 	for _, test := range badRangeTests {
 		t.Run(fmt.Sprintf("ok_bad_range_header/%s", test.rangeHeader), func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusOK)
 			assert.BodyEquals(t, resp, "abcdefghijklmnopqrstuvwxyz")
 		})
@@ -2562,9 +2813,8 @@ func TestRange(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
@@ -2572,35 +2822,41 @@ func TestRange(t *testing.T) {
 
 func TestHTML(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/html")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/html"), nil)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, htmlContentType)
 	assert.BodyContains(t, resp, `<h1>Herman Melville - Moby-Dick</h1>`)
 }
 
 func TestRobots(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/robots.txt")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/robots.txt"), nil)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, textContentType)
 	assert.BodyContains(t, resp, `Disallow: /deny`)
 }
 
 func TestDeny(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/deny")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/deny"), nil)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, textContentType)
 	assert.BodyContains(t, resp, `YOU SHOULDN'T BE HERE`)
 }
 
 func TestCache(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_no_cache", func(t *testing.T) {
 		t.Parallel()
 
 		url := "/cache"
-		req := newTestRequest(t, "GET", url)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
 
 		_ = mustParseResponse[noBodyResponse](t, resp)
 		lastModified := resp.Header.Get("Last-Modified")
@@ -2620,22 +2876,24 @@ func TestCache(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("ok_cache/%s", test.headerKey), func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", "/cache")
+			req := newTestRequest(t, "GET", app.URL("/cache"), nil)
 			req.Header.Add(test.headerKey, test.headerVal)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusNotModified)
 		})
 	}
 }
 
 func TestCacheControl(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_cache_control", func(t *testing.T) {
 		t.Parallel()
 
 		url := "/cache/60"
-		req := newTestRequest(t, "GET", url)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.ContentType(t, resp, jsonContentType)
 		assert.Header(t, resp, "Cache-Control", "public, max-age=60")
@@ -2652,21 +2910,23 @@ func TestCacheControl(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
 }
 
 func TestETag(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_no_headers", func(t *testing.T) {
 		t.Parallel()
 
 		url := "/etag/abc"
-		req := newTestRequest(t, "GET", url)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.Header(t, resp, "ETag", `"abc"`)
 	})
@@ -2693,10 +2953,9 @@ func TestETag(t *testing.T) {
 		t.Run("ok_"+test.name, func(t *testing.T) {
 			t.Parallel()
 			url := "/etag/" + test.etag
-			req := newTestRequest(t, "GET", url)
+			req := newTestRequest(t, "GET", app.URL(url), nil)
 			req.Header.Add(test.headerKey, test.headerVal)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
@@ -2710,21 +2969,23 @@ func TestETag(t *testing.T) {
 	for _, test := range badTests {
 		t.Run(fmt.Sprintf("bad/%s", test.url), func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
 }
 
 func TestBytes(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	t.Run("ok_no_seed", func(t *testing.T) {
 		t.Parallel()
 
 		url := "/bytes/1024"
-		req := newTestRequest(t, "GET", url)
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.ContentType(t, resp, binaryContentType)
 		assert.BodySize(t, resp, 1024)
@@ -2734,9 +2995,9 @@ func TestBytes(t *testing.T) {
 		t.Parallel()
 
 		url := "/bytes/16?seed=1234567890"
-		req := newTestRequest(t, "GET", url)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.ContentType(t, resp, binaryContentType)
 
@@ -2758,9 +3019,8 @@ func TestBytes(t *testing.T) {
 		t.Run("edge"+test.url, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 
 			assert.StatusCode(t, resp, http.StatusOK)
 			assert.Header(t, resp, "Content-Length", strconv.Itoa(test.expectedContentLength))
@@ -2788,15 +3048,17 @@ func TestBytes(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
 }
 
 func TestStreamBytes(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	okTests := []struct {
 		url                   string
 		expectedContentLength int
@@ -2816,9 +3078,8 @@ func TestStreamBytes(t *testing.T) {
 		t.Run("ok"+test.url, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 
 			// Expect empty content-length due to streaming response
 			assert.Header(t, resp, "Content-Length", "")
@@ -2843,16 +3104,16 @@ func TestStreamBytes(t *testing.T) {
 	for _, test := range badTests {
 		t.Run("bad"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
 }
 
 func TestLinks(t *testing.T) {
-	for _, env := range envs {
+	for _, prefix := range []string{"", "/test-prefix"} {
+		app := setupTestApp(t, WithPrefix(prefix))
 
 		redirectTests := []struct {
 			url              string
@@ -2863,13 +3124,12 @@ func TestLinks(t *testing.T) {
 		}
 
 		for _, test := range redirectTests {
-			t.Run("ok"+env.prefix+test.url, func(t *testing.T) {
+			t.Run("ok"+prefix+test.url, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, "GET", env.prefix+test.url, env)
-				resp := must.DoReq(t, env.client, req)
-				defer consumeAndCloseBody(resp)
+				req := newTestRequest(t, "GET", app.URL(prefix+test.url), nil)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, http.StatusFound)
-				assert.Header(t, resp, "Location", env.prefix+test.expectedLocation)
+				assert.Header(t, resp, "Location", prefix+test.expectedLocation)
 			})
 		}
 
@@ -2890,11 +3150,10 @@ func TestLinks(t *testing.T) {
 		}
 
 		for _, test := range errorTests {
-			t.Run("error"+env.prefix+test.url, func(t *testing.T) {
+			t.Run("error"+prefix+test.url, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, "GET", env.prefix+test.url, env)
-				resp := must.DoReq(t, env.client, req)
-				defer consumeAndCloseBody(resp)
+				req := newTestRequest(t, "GET", app.URL(prefix+test.url), nil)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, test.expectedStatus)
 			})
 		}
@@ -2912,14 +3171,13 @@ func TestLinks(t *testing.T) {
 			{"/links/2/-1", `<html><head><title>Links</title></head><body><a href="%[1]s/links/2/0">0</a> <a href="%[1]s/links/2/1">1</a> </body></html>`},
 		}
 		for _, test := range linksPageTests {
-			t.Run("ok"+env.prefix+test.url, func(t *testing.T) {
+			t.Run("ok"+prefix+test.url, func(t *testing.T) {
 				t.Parallel()
-				req := newTestRequest(t, "GET", env.prefix+test.url, env)
-				resp := must.DoReq(t, env.client, req)
-				defer consumeAndCloseBody(resp)
+				req := newTestRequest(t, "GET", app.URL(prefix+test.url), nil)
+				resp := mustDoRequest(t, app, req)
 				assert.StatusCode(t, resp, http.StatusOK)
 				assert.ContentType(t, resp, htmlContentType)
-				expectedContent := fmt.Sprintf(test.expectedContent, env.prefix)
+				expectedContent := fmt.Sprintf(test.expectedContent, prefix)
 				assert.BodyEquals(t, resp, expectedContent)
 			})
 		}
@@ -2927,6 +3185,7 @@ func TestLinks(t *testing.T) {
 }
 
 func TestImage(t *testing.T) {
+	t.Parallel()
 	acceptTests := []struct {
 		acceptHeader        string
 		expectedContentType string
@@ -2938,19 +3197,21 @@ func TestImage(t *testing.T) {
 		{"image/jpeg", "image/jpeg", http.StatusOK},
 		{"image/webp", "image/webp", http.StatusOK},
 		{"image/svg+xml", "image/svg+xml", http.StatusOK},
+		{"image/avif", "image/avif", http.StatusOK},
 
 		{"image/raw", "", http.StatusUnsupportedMediaType},
 		{"image/jpg", "", http.StatusUnsupportedMediaType},
 		{"image/svg", "", http.StatusUnsupportedMediaType},
 	}
 
+	app := setupTestApp(t)
+
 	for _, test := range acceptTests {
 		t.Run("ok/accept="+test.acceptHeader, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", "/image")
+			req := newTestRequest(t, "GET", app.URL("/image"), nil)
 			req.Header.Set("Accept", test.acceptHeader)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 			if test.expectedContentType != "" {
 				assert.ContentType(t, resp, test.expectedContentType)
@@ -2966,6 +3227,7 @@ func TestImage(t *testing.T) {
 		{"/image/jpeg", http.StatusOK},
 		{"/image/webp", http.StatusOK},
 		{"/image/svg", http.StatusOK},
+		{"/image/avif", http.StatusOK},
 
 		{"/image/raw", http.StatusNotFound},
 		{"/image/jpg", http.StatusNotFound},
@@ -2975,9 +3237,8 @@ func TestImage(t *testing.T) {
 	for _, test := range imageTests {
 		t.Run("error"+test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatus)
 		})
 	}
@@ -2985,8 +3246,9 @@ func TestImage(t *testing.T) {
 
 func TestXML(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/xml")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/xml"), nil)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, "application/xml")
 	assert.BodyContains(t, resp, `<?xml version='1.0' encoding='us-ascii'?>`)
 }
@@ -3002,13 +3264,17 @@ func testValidUUIDv4(t *testing.T, uuid string) {
 
 func TestUUID(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/uuid")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/uuid"), nil)
+	resp := mustDoRequest(t, app, req)
 	result := mustParseResponse[uuidResponse](t, resp)
 	testValidUUIDv4(t, result.UUID)
 }
 
 func TestBase64(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	okTests := []struct {
 		requestURL      string
 		want            string
@@ -3075,9 +3341,8 @@ func TestBase64(t *testing.T) {
 	for _, test := range okTests {
 		t.Run("ok"+test.requestURL, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.requestURL)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.requestURL), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusOK)
 			assert.ContentType(t, resp, test.wantContentType)
 			assert.BodyEquals(t, resp, test.want)
@@ -3105,7 +3370,7 @@ func TestBase64(t *testing.T) {
 			"decode failed",
 		},
 		{
-			"/base64/decode/" + strings.Repeat("X", int(maxBodySize)+1),
+			"/base64/decode/" + strings.Repeat("X", int(app.cfg.MaxBodySize)+1),
 			http.StatusBadRequest,
 			"input data exceeds max length",
 		},
@@ -3134,9 +3399,8 @@ func TestBase64(t *testing.T) {
 	for _, test := range errorTests {
 		t.Run("error"+test.requestURL, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.requestURL)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.requestURL), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.expectedStatusCode)
 			assert.BodyContains(t, resp, test.expectedBodyContains)
 		})
@@ -3145,36 +3409,220 @@ func TestBase64(t *testing.T) {
 
 func TestDumpRequest(t *testing.T) {
 	t.Parallel()
+	app := setupTestApp(t)
 
-	req := newTestRequest(t, "GET", "/dump/request?foo=bar")
+	req := newTestRequest(t, "GET", app.URL("/dump/request?foo=bar"), nil)
 	req.Host = "test-host"
 	req.Header.Set("x-test-header2", "Test-Value2")
 	req.Header.Set("x-test-header1", "Test-Value1")
 
-	resp := must.DoReq(t, client, req)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, textContentType)
 	assert.BodyEquals(t, resp, "GET /dump/request?foo=bar HTTP/1.1\r\nHost: test-host\r\nAccept-Encoding: gzip\r\nUser-Agent: Go-http-client/1.1\r\nX-Test-Header1: Test-Value1\r\nX-Test-Header2: Test-Value2\r\n\r\n")
 }
 
 func TestJSON(t *testing.T) {
 	t.Parallel()
-	req := newTestRequest(t, "GET", "/json")
-	resp := must.DoReq(t, client, req)
+	app := setupTestApp(t)
+	req := newTestRequest(t, "GET", app.URL("/json"), nil)
+	resp := mustDoRequest(t, app, req)
 	assert.ContentType(t, resp, jsonContentType)
 	assert.BodyContains(t, resp, `Wake up to WonderWidgets!`)
 }
 
+func TestJSONL(t *testing.T) {
+	t.Parallel()
+
+	app := setupTestApp(t)
+
+	okTests := []struct {
+		url           string
+		expectedLines int
+	}{
+		{"/jsonl", 10},                                  // default count
+		{"/jsonl?count=1", 1},                           // minimum
+		{"/jsonl?count=5", 5},                           // custom count
+		{"/jsonl?count=0", 1},                           // clamped to min
+		{"/jsonl?count=-5", 1},                          // clamped to min
+		{"/jsonl?count=3&duration=100ms", 3},            // with duration
+		{"/jsonl?count=1&duration=100ms", 1},            // single line with duration
+		{"/jsonl?count=3&delay=0s", 3},                  // with zero delay
+		{"/jsonl?count=2&duration=100ms&delay=0s", 2},   // with both
+		{"/jsonl?count=3&duration=100ms&jitter=0", 3},   // jitter=0 (no effect)
+		{"/jsonl?count=3&duration=100ms&jitter=0.5", 3}, // jitter=0.5
+		{"/jsonl?count=3&duration=100ms&jitter=1", 3},   // jitter=1 (max)
+	}
+	for _, test := range okTests {
+		t.Run("ok"+test.url, func(t *testing.T) {
+			t.Parallel()
+
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
+
+			assert.StatusCode(t, resp, http.StatusOK)
+			assert.ContentType(t, resp, jsonlContentType)
+
+			// Expect chunked transfer encoding for streaming
+			assert.Header(t, resp, "Content-Length", "")
+			assert.DeepEqual(t, resp.TransferEncoding, []string{"chunked"}, "expected Transfer-Encoding: chunked")
+
+			i := 0
+			scanner := bufio.NewScanner(resp.Body)
+			for scanner.Scan() {
+				var sr streamResponse
+				err := json.Unmarshal(scanner.Bytes(), &sr)
+				assert.NilError(t, err)
+				assert.Equal(t, sr.ID, i, "bad id")
+				i++
+			}
+			assert.NilError(t, scanner.Err())
+			assert.Equal(t, i, test.expectedLines, "wrong number of lines")
+		})
+	}
+
+	t.Run("ok/count clamped to max", func(t *testing.T) {
+		t.Parallel()
+		maxCount := int(app.cfg.MaxJSONLCount)
+		url := fmt.Sprintf("/jsonl?count=%d", maxCount+500)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
+		resp := mustDoRequest(t, app, req)
+		assert.StatusCode(t, resp, http.StatusOK)
+		i := 0
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			var sr streamResponse
+			err := json.Unmarshal(scanner.Bytes(), &sr)
+			assert.NilError(t, err)
+			i++
+		}
+		assert.NilError(t, scanner.Err())
+		assert.Equal(t, i, maxCount, "wrong number of lines")
+	})
+
+	badTests := []struct {
+		url  string
+		code int
+	}{
+		{"/jsonl?count=foo", http.StatusBadRequest},
+		{"/jsonl?count=3.14", http.StatusBadRequest},
+		{"/jsonl?duration=foo", http.StatusBadRequest},
+		{"/jsonl?delay=foo", http.StatusBadRequest},
+		{"/jsonl?duration=5s&delay=8s", http.StatusBadRequest}, // exceeds max duration
+		{"/jsonl?jitter=-0.1", http.StatusBadRequest},          // jitter below range
+		{"/jsonl?jitter=1.5", http.StatusBadRequest},           // jitter above range
+		{"/jsonl?jitter=abc", http.StatusBadRequest},           // jitter not a number
+	}
+	for _, test := range badTests {
+		t.Run("bad"+test.url, func(t *testing.T) {
+			t.Parallel()
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
+			assert.StatusCode(t, resp, test.code)
+		})
+	}
+
+	t.Run("writes are actually incremental", func(t *testing.T) {
+		t.Parallel()
+
+		// request params
+		var (
+			duration = 100 * time.Millisecond
+			count    = 3
+			endpoint = fmt.Sprintf("/jsonl?duration=%s&count=%d", duration, count)
+		)
+
+		// start timer before sending the request to ensure the client
+		// duration measurement is at least as long as the server's duration,
+		// to avoid flakiness
+		start := time.Now()
+		req := newTestRequest(t, "GET", app.URL(endpoint), nil)
+		resp := mustDoRequest(t, app, req)
+
+		// read incremental writes in a loop. should read one line at a time,
+		// despite the larger read buffer.
+		//
+		scanner := bufio.NewScanner(resp.Body)
+		numReads := 0
+		var sr streamResponse
+		for i := 0; ; i++ {
+			if !scanner.Scan() {
+				assert.NilError(t, scanner.Err()) // Err returns nil on io.EOF
+				break
+			}
+			assert.NilError(t, json.Unmarshal(scanner.Bytes(), &sr))
+			assert.Equal(t, sr.ID, i, "unexpected JSONL line ID")
+			numReads++
+		}
+
+		// writes were incrmemental if a) we did one read per line and b)
+		// reading the whole response took (at least) the expected duration
+		assert.Equal(t, numReads, count, "unexpected number of lines")
+		assert.MinDuration(t, time.Since(start), duration)
+	})
+
+	t.Run("handle cancelation during initial delay", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+
+		req := newTestRequest(t, "GET", app.URL("/jsonl?duration=500ms&delay=500ms"), nil).WithContext(ctx)
+		if _, err := app.Client.Do(req); !os.IsTimeout(err) {
+			t.Fatalf("expected timeout error, got %s", err)
+		}
+	})
+
+	t.Run("handle cancelation during stream", func(t *testing.T) {
+		t.Parallel()
+
+		app := setupTestApp(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		req := newTestRequest(t, "GET", app.URL("/jsonl?duration=900ms&delay=0&count=2"), nil).WithContext(ctx)
+		resp := mustDoRequest(t, app, req)
+
+		assert.StatusCode(t, resp, http.StatusOK)
+
+		// Should time out while trying to read the whole body
+		body, err := io.ReadAll(resp.Body)
+		if !os.IsTimeout(err) {
+			t.Fatalf("expected timeout reading body, got %s", err)
+		}
+
+		// Partial read should include the first line
+		var sr streamResponse
+		scanner := bufio.NewScanner(bytes.NewReader(body))
+		if !scanner.Scan() {
+			t.Fatal("expected at least one JSONL line in partial body")
+		}
+		assert.NilError(t, json.Unmarshal(scanner.Bytes(), &sr))
+		assert.Equal(t, sr.ID, 0, "unexpected JSONL line ID")
+	})
+
+	t.Run("ensure HEAD request works with streaming responses", func(t *testing.T) {
+		t.Parallel()
+		req := newTestRequest(t, "HEAD", app.URL("/jsonl?duration=900ms&delay=100ms"), nil)
+		resp := mustDoRequest(t, app, req)
+		assert.StatusCode(t, resp, http.StatusOK)
+		assert.BodySize(t, resp, 0)
+	})
+}
+
 func TestBearer(t *testing.T) {
-	requestURL := "/bearer"
+	t.Parallel()
+	app := setupTestApp(t)
+	url := "/bearer"
 
 	t.Run("valid_token", func(t *testing.T) {
 		t.Parallel()
 
 		token := "valid_token"
-		req := newTestRequest(t, "GET", requestURL)
+		req := newTestRequest(t, "GET", app.URL(url), nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		resp := must.DoReq(t, client, req)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[bearerResponse](t, resp)
 		want := bearerResponse{
 			Authenticated: true,
@@ -3209,12 +3657,11 @@ func TestBearer(t *testing.T) {
 		t.Run("error"+test.authorizationHeader, func(t *testing.T) {
 			t.Parallel()
 
-			req := newTestRequest(t, "GET", requestURL)
+			req := newTestRequest(t, "GET", app.URL(url), nil)
 			if test.authorizationHeader != "" {
 				req.Header.Set("Authorization", test.authorizationHeader)
 			}
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			resp := mustDoRequest(t, app, req)
 			assert.Header(t, resp, "WWW-Authenticate", "Bearer")
 			assert.StatusCode(t, resp, http.StatusUnauthorized)
 		})
@@ -3222,6 +3669,9 @@ func TestBearer(t *testing.T) {
 }
 
 func TestNotImplemented(t *testing.T) {
+	t.Parallel()
+	app := setupTestApp(t)
+
 	tests := []struct {
 		url string
 	}{
@@ -3230,9 +3680,8 @@ func TestNotImplemented(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.url, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, "GET", test.url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL(test.url), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusNotImplemented)
 		})
 	}
@@ -3241,8 +3690,9 @@ func TestNotImplemented(t *testing.T) {
 func TestHostname(t *testing.T) {
 	t.Run("default hostname", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "GET", "/hostname")
-		resp := must.DoReq(t, client, req)
+		app := setupTestApp(t)
+		req := newTestRequest(t, "GET", app.URL("/hostname"), nil)
+		resp := mustDoRequest(t, app, req)
 		result := mustParseResponse[hostnameResponse](t, resp)
 		assert.Equal(t, result.Hostname, DefaultHostname, "hostname mismatch")
 	})
@@ -3251,23 +3701,51 @@ func TestHostname(t *testing.T) {
 		t.Parallel()
 
 		realHostname := "real-hostname"
-		app := New(WithHostname(realHostname))
-		srv, client := newTestServer(app)
-		defer srv.Close()
+		app := setupTestApp(t, WithHostname(realHostname))
 
-		req, err := http.NewRequest("GET", srv.URL+"/hostname", nil)
-		assert.NilError(t, err)
-
-		resp, err := client.Do(req)
-		assert.NilError(t, err)
+		req := newTestRequest(t, "GET", app.URL("/hostname"), nil)
+		resp := mustDoRequest(t, app, req)
 
 		result := mustParseResponse[hostnameResponse](t, resp)
 		assert.Equal(t, result.Hostname, realHostname, "hostname mismatch")
 	})
 }
 
+func TestVersion(t *testing.T) {
+	t.Run("service only (default)", func(t *testing.T) {
+		t.Parallel()
+		app := setupTestApp(t, WithVersion("go-httpbin", "", "", "", ""))
+		req := newTestRequest(t, "GET", app.URL("/version"), nil)
+		resp := mustDoRequest(t, app, req)
+		result := mustParseResponse[versionResponse](t, resp)
+		assert.DeepEqual(t, result, versionResponse{
+			Service:   "go-httpbin",
+			Version:   "",
+			Commit:    "",
+			BuildDate: "",
+			GoVersion: "",
+		}, "incorrect version response")
+	})
+
+	t.Run("full version info", func(t *testing.T) {
+		t.Parallel()
+		app := setupTestApp(t, WithVersion("go-httpbin", "1.2.3", "abc123", "1988-11-12", "go1.22.0"))
+		req := newTestRequest(t, "GET", app.URL("/version"), nil)
+		resp := mustDoRequest(t, app, req)
+		result := mustParseResponse[versionResponse](t, resp)
+		assert.DeepEqual(t, result, versionResponse{
+			Service:   "go-httpbin",
+			Version:   "1.2.3",
+			Commit:    "abc123",
+			BuildDate: "1988-11-12",
+			GoVersion: "go1.22.0",
+		}, "incorrect version response")
+	})
+}
+
 func TestSSE(t *testing.T) {
 	t.Parallel()
+	app := setupTestApp(t)
 
 	parseServerSentEvent := func(t *testing.T, buf *bufio.Reader) (serverSentEvent, error) {
 		t.Helper()
@@ -3317,41 +3795,42 @@ func TestSSE(t *testing.T) {
 	}
 
 	okTests := []struct {
-		params   *url.Values
+		params   url.Values
 		duration time.Duration
 		count    int
 	}{
 		// there are useful defaults for all values
-		{&url.Values{}, 0, 10},
+		{url.Values{}, 0, 10},
 
 		// go-style durations are accepted
-		{&url.Values{"duration": {"5ms"}}, 5 * time.Millisecond, 10},
-		{&url.Values{"duration": {"10ns"}}, 0, 10},
-		{&url.Values{"delay": {"5ms"}}, 5 * time.Millisecond, 10},
-		{&url.Values{"delay": {"0h"}}, 0, 10},
+		{url.Values{"duration": {"5ms"}}, 5 * time.Millisecond, 10},
+		{url.Values{"duration": {"10ns"}}, 0, 10},
+		{url.Values{"delay": {"5ms"}}, 5 * time.Millisecond, 10},
+		{url.Values{"delay": {"0h"}}, 0, 10},
 
 		// or floating point seconds
-		{&url.Values{"duration": {"0.25"}}, 250 * time.Millisecond, 10},
-		{&url.Values{"duration": {"1"}}, 1 * time.Second, 10},
-		{&url.Values{"delay": {"0.25"}}, 250 * time.Millisecond, 10},
-		{&url.Values{"delay": {"0"}}, 0, 10},
+		{url.Values{"duration": {"0.1"}}, 100 * time.Millisecond, 10},
+		{url.Values{"delay": {"0.1"}}, 100 * time.Millisecond, 10},
+		{url.Values{"delay": {"0"}}, 0, 10},
 
-		{&url.Values{"count": {"1"}}, 0, 1},
-		{&url.Values{"count": {"011"}}, 0, 11},
-		{&url.Values{"count": {fmt.Sprintf("%d", app.maxSSECount)}}, 0, int(app.maxSSECount)},
+		{url.Values{"count": {"1"}}, 0, 1},
+		{url.Values{"count": {"011"}}, 0, 11},
+		{url.Values{"count": {fmt.Sprintf("%d", app.cfg.MaxSSECount)}}, 0, int(app.cfg.MaxSSECount)},
 
-		{&url.Values{"duration": {"250ms"}, "delay": {"250ms"}}, 500 * time.Millisecond, 10},
-		{&url.Values{"duration": {"250ms"}, "delay": {"0.25s"}}, 500 * time.Millisecond, 10},
+		{url.Values{"duration": {"100ms"}, "delay": {"100ms"}}, 200 * time.Millisecond, 10},
+		{url.Values{"duration": {"100ms"}, "delay": {"0.1"}}, 200 * time.Millisecond, 10},
+
+		{url.Values{"duration": {"100ms"}, "jitter": {"0"}}, 100 * time.Millisecond, 10},
+		{url.Values{"duration": {"100ms"}, "jitter": {"0.5"}}, 0, 10},
+		{url.Values{"duration": {"100ms"}, "jitter": {"1"}}, 0, 10},
 	}
 	for _, test := range okTests {
 		t.Run(fmt.Sprintf("ok/%s", test.params.Encode()), func(t *testing.T) {
 			t.Parallel()
-
-			url := "/sse?" + test.params.Encode()
-
+			app := setupTestApp(t)
+			req := newTestRequest(t, "GET", app.URL("/sse", test.params), nil)
 			start := time.Now()
-			req := newTestRequest(t, "GET", url)
-			resp := must.DoReq(t, client, req)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, http.StatusOK)
 			events := parseServerSentEventStream(t, resp)
 
@@ -3365,39 +3844,41 @@ func TestSSE(t *testing.T) {
 	}
 
 	badTests := []struct {
-		params *url.Values
+		params url.Values
 		code   int
 	}{
-		{&url.Values{"duration": {"0"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"0s"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"1m"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"-1ms"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"1001"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"duration": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"0"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"0s"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"1m"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"-1ms"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"1001"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"foo"}}, http.StatusBadRequest},
 
-		{&url.Values{"delay": {"1m"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"-1ms"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"1001"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"delay": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"1m"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"-1ms"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"1001"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"delay": {"foo"}}, http.StatusBadRequest},
 
-		{&url.Values{"count": {"foo"}}, http.StatusBadRequest},
-		{&url.Values{"count": {"0"}}, http.StatusBadRequest},
-		{&url.Values{"count": {"-1"}}, http.StatusBadRequest},
-		{&url.Values{"count": {"0xff"}}, http.StatusBadRequest},
-		{&url.Values{"count": {fmt.Sprintf("%d", app.maxSSECount+1)}}, http.StatusBadRequest},
+		{url.Values{"count": {"foo"}}, http.StatusBadRequest},
+		{url.Values{"count": {"0"}}, http.StatusBadRequest},
+		{url.Values{"count": {"-1"}}, http.StatusBadRequest},
+		{url.Values{"count": {"0xff"}}, http.StatusBadRequest},
+		{url.Values{"count": {fmt.Sprintf("%d", app.cfg.MaxSSECount+1)}}, http.StatusBadRequest},
+
+		{url.Values{"jitter": {"-0.1"}}, http.StatusBadRequest},
+		{url.Values{"jitter": {"1.5"}}, http.StatusBadRequest},
+		{url.Values{"jitter": {"abc"}}, http.StatusBadRequest},
 
 		// request would take too long
-		{&url.Values{"duration": {"750ms"}, "delay": {"500ms"}}, http.StatusBadRequest},
+		{url.Values{"duration": {"750ms"}, "delay": {"500ms"}}, http.StatusBadRequest},
 	}
 	for _, test := range badTests {
 		t.Run(fmt.Sprintf("bad/%s", test.params.Encode()), func(t *testing.T) {
 			t.Parallel()
-			url := "/sse?" + test.params.Encode()
-			req := newTestRequest(t, "GET", url)
-			resp := must.DoReq(t, client, req)
-			defer consumeAndCloseBody(resp)
+			req := newTestRequest(t, "GET", app.URL("/sse", test.params), nil)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, test.code)
 		})
 	}
@@ -3409,47 +3890,34 @@ func TestSSE(t *testing.T) {
 			duration = 100 * time.Millisecond
 			count    = 3
 			endpoint = fmt.Sprintf("/sse?duration=%s&count=%d", duration, count)
-
-			// Match server logic for calculating the delay between writes
-			wantPauseBetweenWrites = duration / time.Duration(count-1)
 		)
 
-		req := newTestRequest(t, "GET", endpoint)
-		resp := must.DoReq(t, client, req)
+		// start timer before sending the request to ensure the client
+		// duration measurement is at least as long as the server's duration,
+		// to avoid flakiness
+		start := time.Now()
+		req := newTestRequest(t, "GET", app.URL(endpoint), nil)
+		resp := mustDoRequest(t, app, req)
+
+		// read incremental writes in a loop. should read one byte at a time,
+		// despite the larger read buffer.
 		buf := bufio.NewReader(resp.Body)
 		eventCount := 0
-
-		// Here we read from the response one byte at a time, and ensure that
-		// at least the expected delay occurs for each read.
-		//
-		// The request above includes an initial delay equal to the expected
-		// wait between writes so that even the first iteration of this loop
-		// expects to wait the same amount of time for a read.
 		for i := 0; ; i++ {
-			start := time.Now()
 			event, err := parseServerSentEvent(t, buf)
 			if err == io.EOF {
 				break
 			}
 			assert.NilError(t, err)
-			gotPause := time.Since(start)
-
-			// We expect to read exactly one byte on each iteration. On the
-			// last iteration, we expct to hit EOF after reading the final
-			// byte, because the server does not pause after the last write.
 			assert.Equal(t, event.ID, i, "unexpected SSE event ID")
-
-			// only ensure that we pause for the expected time between writes
-			// (allowing for minor mismatch in local timers and server timers)
-			// after the first byte.
-			if i > 0 {
-				assert.RoughlyEqual(t, gotPause, wantPauseBetweenWrites, 3*time.Millisecond)
-			}
-
 			eventCount++
 		}
 
+		// writes were incrmemental if a) we read the correct number of events
+		// and b) reading the whole response took (at least) the expected
+		// duration
 		assert.Equal(t, eventCount, count, "unexpected number of events")
+		assert.MinDuration(t, time.Since(start), duration)
 	})
 
 	t.Run("handle cancelation during initial delay", func(t *testing.T) {
@@ -3462,8 +3930,8 @@ func TestSSE(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 		defer cancel()
 
-		req := newTestRequest(t, "GET", "/sse?duration=500ms&delay=500ms").WithContext(ctx)
-		if _, err := client.Do(req); !os.IsTimeout(err) {
+		req := newTestRequest(t, "GET", app.URL("/sse?duration=500ms&delay=500ms"), nil).WithContext(ctx)
+		if _, err := app.Client.Do(req); !os.IsTimeout(err) {
 			t.Fatalf("expected timeout error, got %s", err)
 		}
 	})
@@ -3471,12 +3939,13 @@ func TestSSE(t *testing.T) {
 	t.Run("handle cancelation during stream", func(t *testing.T) {
 		t.Parallel()
 
+		app := setupTestApp(t)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 
-		req := newTestRequest(t, "GET", "/sse?duration=900ms&delay=0&count=2").WithContext(ctx)
-		resp := must.DoReq(t, client, req)
-		defer consumeAndCloseBody(resp)
+		req := newTestRequest(t, "GET", app.URL("/sse?duration=900ms&delay=0&count=2"), nil).WithContext(ctx)
+		resp := mustDoRequest(t, app, req)
 
 		// In this test, the server should have started an OK response before
 		// our client timeout cancels the request, so we should get an OK here.
@@ -3497,8 +3966,8 @@ func TestSSE(t *testing.T) {
 
 	t.Run("ensure HEAD request works with streaming responses", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, "HEAD", "/sse?duration=900ms&delay=100ms")
-		resp := must.DoReq(t, client, req)
+		req := newTestRequest(t, "HEAD", app.URL("/sse?duration=900ms&delay=100ms"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusOK)
 		assert.BodySize(t, resp, 0)
 	})
@@ -3507,18 +3976,18 @@ func TestSSE(t *testing.T) {
 		t.Parallel()
 
 		var (
-			duration = 250 * time.Millisecond
-			delay    = 100 * time.Millisecond
-			count    = 10
+			duration = 100 * time.Millisecond
+			delay    = 50 * time.Millisecond
+			count    = 11 // keep numbers round by ensuring (count-1) evenly divides duration (see computePausePerWrite)
 			params   = url.Values{
 				"duration": {duration.String()},
 				"delay":    {delay.String()},
 				"count":    {strconv.Itoa(count)},
 			}
 		)
-
-		req := newTestRequest(t, "GET", "/sse?"+params.Encode())
-		resp := must.DoReq(t, client, req)
+		app := setupTestApp(t)
+		req := newTestRequest(t, "GET", app.URL("/sse", params), nil)
+		resp := mustDoRequest(t, app, req)
 
 		// need to fully consume body for Server-Timing trailers to arrive
 		must.ReadAll(t, resp.Body)
@@ -3530,13 +3999,13 @@ func TestSSE(t *testing.T) {
 
 		// Ensure total server time makes sense based on duration and delay
 		total := timings["total_duration"]
-		assert.DurationRange(t, total.dur, duration+delay, duration+delay+25*time.Millisecond)
+		assert.MinDuration(t, total.dur, duration+delay)
 
 		// Ensure computed pause time makes sense based on duration, delay, and
 		// numbytes (should be exact, but we're re-parsing a truncated float in
 		// the header value)
 		pause := timings["pause_per_write"]
-		assert.RoughlyEqual(t, pause.dur, duration/time.Duration(count-1), 1*time.Millisecond)
+		assert.MinDuration(t, pause.dur, computePausePerWrite(duration, int64(count)))
 
 		// remaining timings should exactly match request parameters, no need
 		// to adjust for per-run variations
@@ -3551,6 +4020,35 @@ func TestSSE(t *testing.T) {
 	})
 }
 
+func TestUpload(t *testing.T) {
+	app := setupTestApp(t)
+	tests := []struct {
+		contentType string
+		requestBody string
+	}{
+		{"application/octet-stream", "encodeMe"},
+		{"image/png", "encodeMe-png"},
+		{"image/webp", "encodeMe-webp"},
+		{"image/jpeg", "encodeMe-jpeg"},
+		{"unknown", "encodeMe-unknown"},
+	}
+	for _, verb := range []string{"POST", "PUT", "PATCH"} {
+		for _, test := range tests {
+			t.Run("content type/"+test.contentType, func(t *testing.T) {
+				t.Parallel()
+
+				req := newTestRequest(t, verb, app.URL("/upload"), bytes.NewReader([]byte(test.requestBody)))
+				req.Header.Set("Content-Type", test.contentType)
+				resp := mustDoRequest(t, app, req)
+
+				result := mustParseResponse[discardedBodyResponse](t, resp)
+				assert.Equal(t, result.Method, verb, "method mismatch")
+				assert.DeepEqual(t, result.BytesReceived, int64(len(test.requestBody)), "BytesReceived should match requestedBody size")
+			})
+		}
+	}
+}
+
 func TestWebSocketEcho(t *testing.T) {
 	// ========================================================================
 	// Note: Here we only test input validation for the websocket endpoint.
@@ -3558,6 +4056,8 @@ func TestWebSocketEcho(t *testing.T) {
 	// See websocket/*_test.go for in-depth integration tests of the actual
 	// websocket implementation.
 	// ========================================================================
+
+	t.Parallel()
 
 	handshakeHeaders := map[string]string{
 		"Connection":            "upgrade",
@@ -3568,96 +4068,72 @@ func TestWebSocketEcho(t *testing.T) {
 
 	t.Run("handshake ok", func(t *testing.T) {
 		t.Parallel()
-
-		req := newTestRequest(t, http.MethodGet, "/websocket/echo")
+		app := setupTestApp(t)
+		req := newTestRequest(t, http.MethodGet, app.URL("/websocket/echo"), nil)
 		for k, v := range handshakeHeaders {
 			req.Header.Set(k, v)
 		}
-
-		resp, err := client.Do(req)
-		assert.NilError(t, err)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusSwitchingProtocols)
 	})
 
 	t.Run("handshake failed", func(t *testing.T) {
 		t.Parallel()
-		req := newTestRequest(t, http.MethodGet, "/websocket/echo")
-		resp, err := client.Do(req)
-		assert.NilError(t, err)
+		app := setupTestApp(t)
+		req := newTestRequest(t, http.MethodGet, app.URL("/websocket/echo"), nil)
+		resp := mustDoRequest(t, app, req)
 		assert.StatusCode(t, resp, http.StatusBadRequest)
 	})
 
+	maxBodySize := 1024
 	paramTests := []struct {
 		query      string
 		wantStatus int
 	}{
 		// ok
 		{"max_fragment_size=1&max_message_size=2", http.StatusSwitchingProtocols},
-		{fmt.Sprintf("max_fragment_size=%d&max_message_size=%d", app.MaxBodySize, app.MaxBodySize), http.StatusSwitchingProtocols},
+		{fmt.Sprintf("max_fragment_size=%d&max_message_size=%d", maxBodySize, maxBodySize), http.StatusSwitchingProtocols},
 
 		// bad max_framgent_size
 		{"max_fragment_size=-1&max_message_size=2", http.StatusBadRequest},
 		{"max_fragment_size=0&max_message_size=2", http.StatusBadRequest},
 		{"max_fragment_size=3&max_message_size=2", http.StatusBadRequest},
 		{"max_fragment_size=foo&max_message_size=2", http.StatusBadRequest},
-		{fmt.Sprintf("max_fragment_size=%d&max_message_size=2", app.MaxBodySize+1), http.StatusBadRequest},
+		{fmt.Sprintf("max_fragment_size=%d&max_message_size=2", maxBodySize+1), http.StatusBadRequest},
 
 		// bad max_message_size
 		{"max_fragment_size=1&max_message_size=0", http.StatusBadRequest},
 		{"max_fragment_size=1&max_message_size=-1", http.StatusBadRequest},
 		{"max_fragment_size=1&max_message_size=bar", http.StatusBadRequest},
-		{fmt.Sprintf("max_fragment_size=1&max_message_size=%d", app.MaxBodySize+1), http.StatusBadRequest},
+		{fmt.Sprintf("max_fragment_size=1&max_message_size=%d", maxBodySize+1), http.StatusBadRequest},
 	}
 	for _, tc := range paramTests {
 		t.Run(tc.query, func(t *testing.T) {
 			t.Parallel()
-			req := newTestRequest(t, http.MethodGet, "/websocket/echo?"+tc.query)
+			app := setupTestApp(t, WithMaxBodySize(int64(maxBodySize)))
+			req := newTestRequest(t, http.MethodGet, app.URL("/websocket/echo?"+tc.query), nil)
 			for k, v := range handshakeHeaders {
 				req.Header.Set(k, v)
 			}
-			resp, err := client.Do(req)
-			assert.NilError(t, err)
+			resp := mustDoRequest(t, app, req)
 			assert.StatusCode(t, resp, tc.wantStatus)
 		})
 	}
 }
 
-func newTestServer(handler http.Handler) (*httptest.Server, *http.Client) {
-	srv := httptest.NewServer(handler)
-	client := srv.Client()
-	client.Timeout = 5 * time.Second
-	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	return srv, client
-}
-
-func newTestEnvironment(app *HTTPBin) (env *environment) {
-	env = new(environment)
-	env.srv, env.client = newTestServer(app)
-	env.prefix = app.prefix
-	return
-}
-
-func newTestRequest(t *testing.T, verb, path string, envs ...*environment) *http.Request {
+func newTestRequest(t *testing.T, verb, endpoint string, body io.Reader) *http.Request {
 	t.Helper()
-	return newTestRequestWithBody(t, verb, path, nil, envs...)
-}
-
-func newTestRequestWithBody(t *testing.T, verb, path string, body io.Reader, envs ...*environment) *http.Request {
-	t.Helper()
-
-	var env *environment
-	if len(envs) == 0 {
-		env = defaultEnv
-	} else if len(envs) == 1 {
-		env = envs[0]
-	} else {
-		t.Fatal("Only zero or one environment are allowed")
-	}
-	req, err := http.NewRequest(verb, env.srv.URL+path, body)
+	req, err := http.NewRequest(verb, endpoint, body)
 	assert.NilError(t, err)
 	return req
+}
+
+func mustDoRequest(t *testing.T, app *appTestInfo, req *http.Request) *http.Response {
+	t.Helper()
+	resp, err := app.Client.Do(req)
+	assert.NilError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
 }
 
 func mustParseResponse[T any](t *testing.T, resp *http.Response) T {
@@ -3665,17 +4141,4 @@ func mustParseResponse[T any](t *testing.T, resp *http.Response) T {
 	assert.StatusCode(t, resp, http.StatusOK)
 	assert.ContentType(t, resp, jsonContentType)
 	return must.Unmarshal[T](t, resp.Body)
-}
-
-func consumeAndCloseBody(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func assertHeaderEqual(t *testing.T, header *http.Header, key, want string) {
-	t.Helper()
-	got := header.Get(key)
-	if want != got {
-		t.Fatalf("expected header %s=%#v, got %#v", key, want, got)
-	}
 }

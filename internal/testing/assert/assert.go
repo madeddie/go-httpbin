@@ -57,6 +57,14 @@ func Error(t *testing.T, got, expected error) {
 	}
 }
 
+// MinDuration asserts that got >= min.
+func MinDuration(t *testing.T, got time.Duration, wantMin time.Duration) {
+	t.Helper()
+	if got < wantMin {
+		t.Errorf("expected duration %s >= %s", got, wantMin)
+	}
+}
+
 // StatusCode asserts that a response has a specific status code.
 func StatusCode(t *testing.T, resp *http.Response, code int) {
 	t.Helper()
@@ -119,24 +127,4 @@ func BodySize(t *testing.T, resp *http.Response, want int) {
 	t.Helper()
 	got := must.ReadAll(t, resp.Body)
 	Equal(t, len(got), want, "incorrect response body size")
-}
-
-// DurationRange asserts that a duration is within a specific range.
-func DurationRange(t *testing.T, got, minVal, maxVal time.Duration) {
-	t.Helper()
-	if got < minVal || got > maxVal {
-		t.Fatalf("expected duration between %s and %s, got %s", minVal, maxVal, got)
-	}
-}
-
-type number interface {
-	~int64 | ~float64
-}
-
-// RoughlyEqual asserts that a numeric value is within a certain tolerance.
-func RoughlyEqual[T number](t *testing.T, got, want T, epsilon T) {
-	t.Helper()
-	if got < want-epsilon || got > want+epsilon {
-		t.Fatalf("expected value between %v and %v, got %v", want-epsilon, want+epsilon, got)
-	}
 }

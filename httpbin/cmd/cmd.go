@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,7 +27,11 @@ const (
 	defaultListenHost = "0.0.0.0"
 	defaultListenPort = 8080
 	defaultLogFormat  = "text"
+	defaultLogLevel   = "INFO"
 	defaultEnvPrefix  = "HTTPBIN_ENV_"
+
+	// Disable all logging by setting the level above any possible value
+	logLevelOff = slog.Level(math.MaxInt)
 
 	// Reasonable defaults for the underlying http.Server
 	defaultSrvReadTimeout       = 5 * time.Second
@@ -33,15 +39,22 @@ const (
 	defaultSrvMaxHeaderBytes    = 16 * 1024 // 16kb
 )
 
+// BuildInfo holds build metadata.
+type BuildInfo struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
 // Main is the main entrypoint for the go-httpbin binary. See loadConfig() for
 // command line argument parsing.
-func Main() int {
-	return mainImpl(os.Args[1:], os.Getenv, os.Environ, os.Hostname, os.Stderr)
+func Main(build BuildInfo) int {
+	return mainImpl(os.Args[1:], build, os.Getenv, os.Environ, os.Hostname, os.Stderr)
 }
 
 // mainImpl is the real implementation of Main(), extracted for better
 // testability.
-func mainImpl(args []string, getEnvVal func(string) string, getEnviron func() []string, getHostname func() (string, error), out io.Writer) int {
+func mainImpl(args []string, build BuildInfo, getEnvVal func(string) string, getEnviron func() []string, getHostname func() (string, error), out io.Writer) int {
 	cfg, err := loadConfig(args, getEnvVal, getEnviron, getHostname)
 	if err != nil {
 		if cfgErr, ok := err.(ConfigError); ok {
@@ -67,13 +80,12 @@ func mainImpl(args []string, getEnvVal func(string) string, getEnviron func() []
 		return 1
 	}
 
-	logger := slog.New(slog.NewTextHandler(out, nil))
-
-	if cfg.LogFormat == "json" {
-		// use structured logging if requested
-		handler := slog.NewJSONHandler(out, nil)
-		logger = slog.New(handler)
+	if cfg.ShowVersion {
+		fmt.Fprintf(out, "go-httpbin version %s\n%s %s %s\n", build.Version, runtime.Version(), build.Commit, build.Date)
+		return 0
 	}
+
+	logger := setupLogger(out, cfg.LogFormat, cfg.LogLevel)
 
 	opts := []httpbin.OptionFunc{
 		httpbin.WithEnv(cfg.Env),
@@ -81,6 +93,9 @@ func mainImpl(args []string, getEnvVal func(string) string, getEnviron func() []
 		httpbin.WithMaxDuration(cfg.MaxDuration),
 		httpbin.WithObserver(httpbin.StdLogObserver(logger)),
 		httpbin.WithExcludeHeaders(cfg.ExcludeHeaders),
+	}
+	if cfg.UseFullVersion {
+		opts = append(opts, httpbin.WithVersion("go-httpbin", build.Version, build.Commit, build.Date, runtime.Version()))
 	}
 	if cfg.Prefix != "" {
 		opts = append(opts, httpbin.WithPrefix(cfg.Prefix))
@@ -127,6 +142,7 @@ type config struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	LogFormat              string
+	LogLevel               slog.Level
 	SrvMaxHeaderBytes      int
 	SrvReadHeaderTimeout   time.Duration
 	SrvReadTimeout         time.Duration
@@ -139,8 +155,15 @@ type config struct {
 	// absolutely necessary.
 	UnsafeAllowDangerousResponses bool
 
+	// If true, print version info and exit.
+	ShowVersion bool
+
+	// If true, expose full version details via /version (default: service name only).
+	UseFullVersion bool
+
 	// temporary placeholders for arguments that need extra processing
 	rawAllowedRedirectDomains string
+	rawLogLevel               string
 	rawUseRealHostname        bool
 }
 
@@ -165,6 +188,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	cfg := &config{}
 
 	fs := flag.NewFlagSet("go-httpbin", flag.ContinueOnError)
+	fs.BoolVar(&cfg.ShowVersion, "version", false, "Print version and exit")
 	fs.BoolVar(&cfg.rawUseRealHostname, "use-real-hostname", false, "Expose value of os.Hostname() in the /hostname endpoint instead of dummy value")
 	fs.DurationVar(&cfg.MaxDuration, "max-duration", httpbin.DefaultMaxDuration, "Maximum duration a response may take")
 	fs.Int64Var(&cfg.MaxBodySize, "max-body-size", httpbin.DefaultMaxBodySize, "Maximum size of request or response, in bytes")
@@ -176,6 +200,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	fs.StringVar(&cfg.TLSKeyFile, "https-key-file", "", "HTTPS Server private key file")
 	fs.StringVar(&cfg.ExcludeHeaders, "exclude-headers", "", "Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard matching.")
 	fs.StringVar(&cfg.LogFormat, "log-format", defaultLogFormat, "Log format (text or json)")
+	fs.StringVar(&cfg.rawLogLevel, "log-level", defaultLogLevel, "Logging level (DEBUG, INFO, WARN, ERROR, OFF)")
 	fs.IntVar(&cfg.SrvMaxHeaderBytes, "srv-max-header-bytes", defaultSrvMaxHeaderBytes, "Value to use for the http.Server's MaxHeaderBytes option")
 	fs.DurationVar(&cfg.SrvReadHeaderTimeout, "srv-read-header-timeout", defaultSrvReadHeaderTimeout, "Value to use for the http.Server's ReadHeaderTimeout option")
 	fs.DurationVar(&cfg.SrvReadTimeout, "srv-read-timeout", defaultSrvReadTimeout, "Value to use for the http.Server's ReadTimeout option")
@@ -183,6 +208,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	// Here be dragons! This flag is only for backwards compatibility and
 	// should not be used in production.
 	fs.BoolVar(&cfg.UnsafeAllowDangerousResponses, "unsafe-allow-dangerous-responses", false, "Allow endpoints to return unescaped HTML when clients control response Content-Type (enables XSS attacks)")
+	fs.BoolVar(&cfg.UseFullVersion, "use-full-version", false, "Expose full version details via /version (default: service name only)")
 
 	// in order to fully control error output whether CLI arguments or env vars
 	// are used to configure the app, we need to take control away from the
@@ -272,6 +298,13 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	if cfg.LogFormat != "text" && cfg.LogFormat != "json" {
 		return nil, configErr(`invalid log format %q, must be "text" or "json"`, cfg.LogFormat)
 	}
+	if cfg.rawLogLevel == defaultLogLevel && getEnvVal("LOG_LEVEL") != "" {
+		cfg.rawLogLevel = getEnvVal("LOG_LEVEL")
+	}
+	cfg.LogLevel, err = parseLogLevel(cfg.rawLogLevel)
+	if err != nil {
+		return nil, configErr(`invalid log level %q, must be one of "DEBUG", "INFO", "WARN", "ERROR", "OFF"`, cfg.rawLogLevel)
+	}
 
 	if getEnvBool(getEnvVal("USE_REAL_HOSTNAME")) {
 		cfg.rawUseRealHostname = true
@@ -287,7 +320,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	if cfg.rawAllowedRedirectDomains == "" && getEnvVal("ALLOWED_REDIRECT_DOMAINS") != "" {
 		cfg.rawAllowedRedirectDomains = getEnvVal("ALLOWED_REDIRECT_DOMAINS")
 	}
-	for _, domain := range strings.Split(cfg.rawAllowedRedirectDomains, ",") {
+	for domain := range strings.SplitSeq(cfg.rawAllowedRedirectDomains, ",") {
 		if strings.TrimSpace(domain) != "" {
 			cfg.AllowedRedirectDomains = append(cfg.AllowedRedirectDomains, strings.TrimSpace(domain))
 		}
@@ -316,9 +349,13 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	if getEnvBool(getEnvVal("UNSAFE_ALLOW_DANGEROUS_RESPONSES")) {
 		cfg.UnsafeAllowDangerousResponses = true
 	}
+	if getEnvBool(getEnvVal("USE_FULL_VERSION")) {
+		cfg.UseFullVersion = true
+	}
 
 	// reset temporary fields to their zero values
 	cfg.rawAllowedRedirectDomains = ""
+	cfg.rawLogLevel = ""
 	cfg.rawUseRealHostname = false
 
 	for _, envVar := range getEnviron() {
@@ -337,6 +374,42 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 
 func getEnvBool(val string) bool {
 	return val == "1" || val == "true"
+}
+
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "DEBUG":
+		return slog.LevelDebug, nil
+	case "INFO":
+		return slog.LevelInfo, nil
+	case "WARN":
+		return slog.LevelWarn, nil
+	case "ERROR":
+		return slog.LevelError, nil
+	case "OFF":
+		return logLevelOff, nil
+	default:
+		return 0, fmt.Errorf("invalid log level %q", s)
+	}
+}
+
+func setupLogger(out io.Writer, logFormat string, level slog.Level) *slog.Logger {
+	if level == logLevelOff {
+		out = io.Discard
+	}
+
+	opts := &slog.HandlerOptions{
+		Level: level,
+	}
+
+	var handler slog.Handler
+	if logFormat == "json" {
+		handler = slog.NewJSONHandler(out, opts)
+	} else {
+		handler = slog.NewTextHandler(out, opts)
+	}
+
+	return slog.New(handler)
 }
 
 func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger) error {
