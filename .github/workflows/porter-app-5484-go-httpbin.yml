@@ -17,7 +17,7 @@ jobs:
               uses: porter-dev/setup-porter@v0.1.0
             - name: Deploy stack
               timeout-minutes: 30
-              run: porter apply
+              run: porter apply --tag $PORTER_TAG
               env:
                 PORTER_APP_NAME: go-httpbin
                 PORTER_CLUSTER: "5484"
